@@ -1,6 +1,10 @@
 # Codex Devil's Advocate
 
 <p align="center">
+  <img src="assets/codex-devils-advocate-banner.jpg" alt="Codex Devil's Advocate — token-efficient adversarial review for Codex" width="100%" />
+</p>
+
+<p align="center">
   <strong>A token-efficient adversarial review skill for Codex.</strong><br/>
   It does not try to approve your code — it tries to <em>break</em> it.
 </p>
