@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-  <strong>Not sure your code is really ready?</strong><br/>
-  Run the skill and let a second reviewer try to break it before your users do.
+  <strong>Codex wrote the solution. Now give it an opponent.</strong><br/>
+  One agent builds it. Another challenges it and helps make the code better.
 </p>
 
 <p align="center">
@@ -23,13 +23,9 @@
 
 ---
 
-## Not sure the code is actually done?
+## Codex wrote the solution. Now give it an opponent.
 
-The feature is written. Tests are green. Codex says everything looks good.
-
-But there is still one question:
-
-> **What did we miss?**
+The longer AI works on one task, the easier it is for it to **miss its own mistakes**.
 
 Run:
 
@@ -37,11 +33,9 @@ Run:
 $adversarial-review
 ```
 
-Think of it like handing the finished change to a second engineer with one job: **find a real way this code can fail.**
+A separate reviewer challenges the solution, looks for weak spots, and helps turn it into **better code**.
 
-Found a real bug? Codex checks the claim, fixes the code, and rechecks only the part that changed. Nothing serious found? You stop.
-
-**Write → doubt → check → fix → ship.**
+**Not just another review. A second point of view built to disagree.**
 
 No reviewer swarm. No endless loops. No burning tokens just to hear “looks good.”
 
