@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-  <strong>A token-efficient adversarial review skill for Codex.</strong><br/>
-  It does not try to approve your code — it tries to <em>break</em> it.
+  <strong>Not sure your code is really ready?</strong><br/>
+  Run the skill and let a second reviewer try to break it before your users do.
 </p>
 
 <p align="center">
@@ -23,17 +23,27 @@
 
 ---
 
-## Stop asking your coding agent if the code is correct.
+## Not sure the code is actually done?
 
-Ask another agent to prove that it is **wrong**.
+The feature is written. Tests are green. Codex says everything looks good.
 
-Most AI review workflows fail in one of two directions: they are too shallow to catch subtle bugs, or they burn huge amounts of context and tokens by launching multiple reviewers and repeatedly rescanning the repository.
+But there is still one question:
 
-**Codex Devil's Advocate** takes a different approach.
+> **What did we miss?**
 
-> One strong adversarial reviewer. One full pass. Up to two focused rechecks. Only evidence-backed defects keep the loop alive.
+Run:
 
-The result is a review workflow designed around **maximum defect-finding value per token spent**.
+```text
+$adversarial-review
+```
+
+Think of it like handing the finished change to a second engineer with one job: **find a real way this code can fail.**
+
+Found a real bug? Codex checks the claim, fixes the code, and rechecks only the part that changed. Nothing serious found? You stop.
+
+**Write → doubt → check → fix → ship.**
+
+No reviewer swarm. No endless loops. No burning tokens just to hear “looks good.”
 
 ---
 
