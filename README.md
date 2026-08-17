@@ -10,22 +10,6 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Codex-Skill-111827?style=for-the-badge&logo=openai&logoColor=white" alt="Codex Skill" />
-  <img src="https://img.shields.io/badge/Review%20Mode-Adversarial-7c3aed?style=for-the-badge" alt="Adversarial Review" />
-  <img src="https://img.shields.io/badge/Reviewer-1%20Subagent-0f766e?style=for-the-badge" alt="1 Reviewer" />
-  <img src="https://img.shields.io/badge/Rechecks-Up%20to%202-f59e0b?style=for-the-badge" alt="2 Rechecks" />
-  <img src="https://img.shields.io/badge/Sandbox-Read--Only-1d4ed8?style=for-the-badge" alt="Read Only" />
-  <img src="https://img.shields.io/badge/Install-Global-16a34a?style=for-the-badge" alt="Global Install" />
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/Strategy-Diff--First-374151?style=flat-square" alt="Diff First" />
-  <img src="https://img.shields.io/badge/Focus-Concrete%20Defects-374151?style=flat-square" alt="Concrete Defects" />
-  <img src="https://img.shields.io/badge/Goal-Max%20Signal%20per%20Token-374151?style=flat-square" alt="Token Efficient" />
-  <img src="https://img.shields.io/badge/Works%20With-Codex-374151?style=flat-square" alt="Works with Codex" />
-</p>
-
-<p align="center">
   <a href="#the-idea"><img src="https://img.shields.io/badge/HOW%20IT%20WORKS-991b1b?style=for-the-badge&logo=gitbook&logoColor=white" alt="How it works" /></a>
   <a href="#installation"><img src="https://img.shields.io/badge/INSTALL-dc2626?style=for-the-badge&logo=gnubash&logoColor=white" alt="Install" /></a>
   <a href="#usage"><img src="https://img.shields.io/badge/USAGE-991b1b?style=for-the-badge&logo=windowsterminal&logoColor=white" alt="Usage" /></a>
