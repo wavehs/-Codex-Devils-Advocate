@@ -5,6 +5,11 @@
 </p>
 
 <p align="center">
+  <a href="README.md"><img src="https://img.shields.io/badge/English-dc2626?style=for-the-badge" alt="English" /></a>
+  <a href="README.ru.md"><img src="https://img.shields.io/badge/Русский-18181b?style=for-the-badge" alt="Русский" /></a>
+</p>
+
+<p align="center">
   <strong>A token-efficient adversarial review skill for Codex.</strong><br/>
   It does not try to approve your code — it tries to <em>break</em> it.
 </p>
