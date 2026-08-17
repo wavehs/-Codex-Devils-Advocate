@@ -1,0 +1,7 @@
+interface:
+  display_name: "Adversarial Review"
+  short_description: "Token-efficient red-team correctness review"
+  default_prompt: "Run $adversarial-review on the completed code change in the current task."
+
+policy:
+  allow_implicit_invocation: false
