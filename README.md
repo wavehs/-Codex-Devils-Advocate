@@ -25,6 +25,13 @@
   <img src="https://img.shields.io/badge/Works%20With-Codex-374151?style=flat-square" alt="Works with Codex" />
 </p>
 
+<p align="center">
+  <a href="#the-idea"><img src="https://img.shields.io/badge/HOW%20IT%20WORKS-991b1b?style=for-the-badge&logo=gitbook&logoColor=white" alt="How it works" /></a>
+  <a href="#installation"><img src="https://img.shields.io/badge/INSTALL-dc2626?style=for-the-badge&logo=gnubash&logoColor=white" alt="Install" /></a>
+  <a href="#usage"><img src="https://img.shields.io/badge/USAGE-991b1b?style=for-the-badge&logo=windowsterminal&logoColor=white" alt="Usage" /></a>
+  <a href="#token-efficiency-by-design"><img src="https://img.shields.io/badge/LOW%20TOKEN%20DESIGN-dc2626?style=for-the-badge&logo=lightning&logoColor=white" alt="Low token design" /></a>
+</p>
+
 ---
 
 ## Stop asking your coding agent if the code is correct.
