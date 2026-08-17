@@ -1,7 +1,7 @@
 # Codex Devil's Advocate
 
 <p align="center">
-  <img src="assets/codex-devils-advocate-banner.jpg" alt="Codex Devil's Advocate — token-efficient adversarial review for Codex" width="100%" />
+  <img src="assets/C048235B-D8A8-42E4-A298-E52B5E3388A0.png" alt="Codex Devil's Advocate — token-efficient adversarial review for Codex" width="100%" />
 </p>
 
 <p align="center">
