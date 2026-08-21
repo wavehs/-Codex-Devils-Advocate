@@ -101,6 +101,8 @@ No reviewer swarm. No endless recursive review loop. No full repository reread a
 | **Diff-first** | Starts from the actual change instead of ingesting the whole repository |
 | **Evidence-first** | Findings need a concrete trigger, execution path, and incorrect result |
 | **Objective verification** | CRITICAL/HIGH rejections require executable or repository evidence |
+| **Immutable finding lifecycle** | Every finding is hash-linked from origin through classification, fix, and reviewer verification |
+| **Receipt-based integrity** | Preflight, reviewer turns, snapshots, validation, and the final manifest are derived from evidence artifacts—not free booleans |
 | **Fail-closed result** | Reviewer failures, incomplete scope, or high-risk uncertainty produce INCONCLUSIVE |
 | **Bounded re-review** | One initial full review, up to one escalation full review, and at most two incremental rechecks |
 | **Global installation** | Install once and use in every Codex project |
@@ -190,7 +192,7 @@ The target is selected from, in order:
 3. current staged, unstaged, and untracked changes
 4. branch comparison when it can be determined reliably
 
-The target is frozen with HEAD and merge-base SHAs, file statuses, content hashes, a Git-status hash, and a canonical diff hash. Untracked files are listed explicitly and reviewed in full. The worktree is captured before and after every reviewer turn.
+The target is frozen with HEAD and merge-base SHAs, file statuses, content hashes, a Git-status hash, and a canonical diff hash. Empty scopes and unresolved merge conflicts are rejected. Untracked files are listed explicitly and reviewed in full. The worktree is captured before and after every reviewer turn.
 
 This prevents both scope drift and accidental omission while keeping the reviewer out of unrelated legacy code.
 
@@ -236,7 +238,16 @@ REJECTED
 UNCERTAIN
 ```
 
-Only confirmed defects should normally lead to code changes. A CRITICAL or HIGH finding can be rejected only with objective evidence such as a reproduction, an exact regression test, a documented contract, a type invariant, validation logic, or a concrete repository reference. An unresolved UNCERTAIN CRITICAL/HIGH finding forbids PASS.
+Classification is separate from resolution:
+
+```text
+CONFIRMED + OPEN  → blocking
+CONFIRMED + FIXED → closed only by a validated re-review
+REJECTED + NOT_APPLICABLE
+UNCERTAIN + OPEN
+```
+
+The guard reads findings directly from the original validated reviewer results and preserves their IDs, severity, origin review/manifest, and content hashes. The main agent cannot remove or rewrite them in the final decision. A CRITICAL or HIGH finding can be rejected only with objective evidence hash-linked to a passing validation receipt or reviewed repository content. An unresolved UNCERTAIN CRITICAL/HIGH finding forbids PASS.
 
 This matters because an AI critic can be confidently wrong too.
 
@@ -255,7 +266,7 @@ PASS requires:
 ```text
 review integrity proven
 + final scope hash matches the reviewed version
-+ zero confirmed blocking correctness defects
++ every confirmed blocking finding is reviewer-verified FIXED
 + zero unresolved UNCERTAIN CRITICAL/HIGH findings
 ```
 
@@ -431,7 +442,7 @@ Only the transferred amount should leave the source stack.
 
 The main Codex agent verifies the path, confirms the bug, fixes it, and adds a regression test.
 
-The same reviewer receives only the resulting patch and checks whether:
+The same reviewer receives the resulting patch and every finding ID that must be closed. It must explicitly return `FIXED`, `STILL_PRESENT`, or `UNRESOLVED` for each one and checks whether:
 
 - the original failure is actually fixed
 - the fix created a nearby regression
@@ -526,7 +537,7 @@ Controls the review workflow, budget, scope selection, verification loop, fix lo
 
 ### `review_guard.py`
 
-Deterministically captures complete change manifests, verifies immutable snapshots and reviewer JSON, escalates large fixes, and computes PASS, FAIL, or INCONCLUSIVE.
+Deterministically captures complete change manifests, seals custom-agent/turn/snapshot/validation receipts, preserves finding lifecycles, automatically detects semantic escalation, and computes PASS, FAIL, or INCONCLUSIVE from original reviewer artifacts.
 
 ### `adversarial-reviewer.toml`
 

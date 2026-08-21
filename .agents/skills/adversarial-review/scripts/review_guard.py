@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
-"""Deterministic integrity guard for the adversarial-review skill."""
+"""Fail-closed evidence guard for the adversarial-review skill.
+
+The guard deliberately accepts artifacts, not conclusions.  Receipts are hashes of
+runtime metadata and validated files; they are useful only while accompanied by the
+original artifact from which they were produced.
+"""
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
-import math
 import os
+import re
 import stat
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Iterable
 
 
-PROTOCOL_VERSION = "1"
-BLOCKING_SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM"}
-SEVERITIES = BLOCKING_SEVERITIES | {"LOW"}
+PROTOCOL_VERSION = "2"
+REVIEWER_NAME = "adversarial_reviewer"
+REVIEWER_MODEL = "gpt-5.6-terra"
+SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW"}
+BLOCKING = {"CRITICAL", "HIGH", "MEDIUM"}
 CLASSIFICATIONS = {"CONFIRMED", "REJECTED", "UNCERTAIN"}
-REJECTION_EVIDENCE_TYPES = {
+RESOLUTIONS = {"OPEN", "FIXED", "NOT_APPLICABLE"}
+VERIFICATIONS = {"FIXED", "STILL_PRESENT", "UNRESOLVED"}
+EVIDENCE_TYPES = {
     "executable_reproduction",
     "passing_regression_test",
     "acceptance_criterion",
@@ -28,56 +38,28 @@ REJECTION_EVIDENCE_TYPES = {
     "validation_logic",
     "repository_evidence",
 }
-SEMANTIC_ESCALATIONS = {
-    "public-api",
-    "schema",
-    "persistence",
-    "concurrency",
-    "core-invariant",
-    "architecture",
-    "core-algorithm",
-}
 
 
 class GuardError(RuntimeError):
     pass
 
 
-def sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def canonical(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
-def canonical_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+def sha(value: Any) -> str:
+    return hashlib.sha256(canonical(value)).hexdigest()
 
 
-def run_git(repo: Path, *args: str, check: bool = True) -> bytes:
-    env = os.environ.copy()
-    env["LC_ALL"] = "C"
-    process = subprocess.run(
-        ["git", "-c", "core.quotepath=false", *args],
-        cwd=repo,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if check and process.returncode != 0:
-        message = process.stderr.decode("utf-8", "replace").strip()
-        raise GuardError(f"git {' '.join(args)} failed: {message}")
-    return process.stdout
-
-
-def git_text(repo: Path, *args: str) -> str:
-    return run_git(repo, *args).decode("utf-8", "strict").strip()
-
-
-def normalize_repo(repo_arg: str) -> Path:
-    requested = Path(repo_arg).resolve()
-    root = Path(git_text(requested, "rev-parse", "--show-toplevel")).resolve()
-    return root
+def file_sha(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 def normalize_path(raw_path: str) -> str:
@@ -87,618 +69,755 @@ def normalize_path(raw_path: str) -> str:
     return candidate.as_posix()
 
 
-def parse_name_status(data: bytes, layer: str) -> list[dict[str, Any]]:
-    tokens = data.decode("utf-8", "surrogateescape").split("\0")
-    if tokens and tokens[-1] == "":
-        tokens.pop()
-    result: list[dict[str, Any]] = []
-    index = 0
-    names = {
-        "A": "ADDED",
-        "M": "MODIFIED",
-        "D": "DELETED",
-        "R": "RENAMED",
-        "C": "COPIED",
-        "T": "TYPE_CHANGED",
-        "U": "UNMERGED",
-    }
-    while index < len(tokens):
-        status_code = tokens[index]
-        index += 1
-        if not status_code:
-            raise GuardError(f"malformed {layer} name-status output")
-        kind = status_code[0]
-        if kind not in names or index >= len(tokens):
-            raise GuardError(f"unsupported {layer} status: {status_code!r}")
-        if kind in {"R", "C"}:
-            if index + 1 >= len(tokens):
-                raise GuardError(f"malformed {layer} rename/copy record")
-            old_path = normalize_path(tokens[index])
-            path = normalize_path(tokens[index + 1])
-            index += 2
-            result.append(
-                {
-                    "layer": layer,
-                    "change_type": names[kind],
-                    "status_code": status_code,
-                    "old_path": old_path,
-                    "path": path,
-                }
-            )
-        else:
-            path = normalize_path(tokens[index])
-            index += 1
-            result.append(
-                {
-                    "layer": layer,
-                    "change_type": names[kind],
-                    "status_code": status_code,
-                    "path": path,
-                }
-            )
-    return result
-
-
-def untracked_changes(repo: Path) -> list[dict[str, Any]]:
-    data = run_git(repo, "ls-files", "--others", "--exclude-standard", "-z")
-    paths = data.decode("utf-8", "surrogateescape").split("\0")
-    return [
-        {
-            "layer": "untracked",
-            "change_type": "UNTRACKED",
-            "status_code": "??",
-            "path": normalize_path(path),
-        }
-        for path in paths
-        if path
-    ]
-
-
-def path_fingerprint(repo: Path, relative_path: str) -> dict[str, Any]:
-    path = repo / relative_path
+def path_fingerprint(repo: Path, rel: str) -> dict[str, Any]:
+    path = repo / normalize_path(rel)
     try:
         mode = path.lstat().st_mode
     except FileNotFoundError:
         return {"kind": "missing", "size": None, "sha256": None}
     except OSError as exc:
-        raise GuardError(f"cannot stat {relative_path}: {exc}") from exc
-
+        raise GuardError(f"cannot stat {rel}: {exc}") from exc
     if stat.S_ISLNK(mode):
-        try:
-            target = os.readlink(path)
-        except OSError as exc:
-            raise GuardError(f"cannot read symlink {relative_path}: {exc}") from exc
+        target = os.readlink(path)
         payload = b"symlink\0" + os.fsencode(target)
-        return {"kind": "symlink", "size": len(payload), "sha256": sha256(payload)}
+        return {"kind": "symlink", "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
     if stat.S_ISREG(mode):
-        digest = hashlib.sha256()
-        size = 0
-        try:
-            with path.open("rb") as handle:
-                while chunk := handle.read(1024 * 1024):
-                    digest.update(chunk)
-                    size += len(chunk)
-        except OSError as exc:
-            raise GuardError(f"cannot read {relative_path}: {exc}") from exc
-        return {"kind": "file", "size": size, "sha256": digest.hexdigest()}
+        return {"kind": "file", "size": path.stat().st_size, "sha256": file_sha(path)}
     if stat.S_ISDIR(mode):
-        submodule_head = run_git(path, "rev-parse", "HEAD", check=False).decode(
-            "utf-8", "replace"
-        ).strip()
-        submodule_status = run_git(path, "status", "--porcelain=v2", "-z", check=False)
-        payload = b"directory\0" + submodule_head.encode() + b"\0" + submodule_status
-        return {"kind": "directory", "size": None, "sha256": sha256(payload)}
-    raise GuardError(f"unsupported filesystem object in scope: {relative_path}")
+        payload = _run_bytes(str(path), "rev-parse", "HEAD", check=False).stdout + b"\0" + _run_bytes(str(path), "status", "--porcelain=v2", "-z", check=False).stdout
+        return {"kind": "directory", "size": None, "sha256": hashlib.sha256(payload).hexdigest()}
+    raise GuardError(f"unsupported filesystem object in scope: {rel}")
 
 
-def baseline_fingerprint(repo: Path, reference: str, path: str) -> str | None:
-    process = subprocess.run(
-        ["git", "-c", "core.quotepath=false", "show", f"{reference}:{path}"],
-        cwd=repo,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+def _run(repo: str, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        ["git", "-c", "core.quotepath=false", *args], cwd=repo, text=True,
+        encoding="utf-8", errors="surrogateescape", capture_output=True, check=False
     )
-    if process.returncode != 0:
-        return None
-    return sha256(process.stdout)
+    if check and proc.returncode:
+        raise GuardError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc
 
 
-def patch_stats(parts: list[tuple[str, bytes]]) -> dict[str, Any]:
-    additions = 0
-    deletions = 0
-    binary_parts = 0
-    total_bytes = 0
-    digest = hashlib.sha256()
-    for label, data in parts:
-        label_bytes = label.encode("utf-8")
-        digest.update(len(label_bytes).to_bytes(4, "big"))
-        digest.update(label_bytes)
-        digest.update(len(data).to_bytes(8, "big"))
-        digest.update(data)
-        total_bytes += len(data)
-        if b"GIT binary patch" in data or b"Binary files " in data:
-            binary_parts += 1
-        for line in data.splitlines():
-            if line.startswith(b"+") and not line.startswith(b"+++"):
-                additions += 1
-            elif line.startswith(b"-") and not line.startswith(b"---"):
-                deletions += 1
-    return {
-        "sha256": digest.hexdigest(),
-        "bytes": total_bytes,
-        "additions": additions,
-        "deletions": deletions,
-        "changed_lines": additions + deletions,
-        "binary_parts": binary_parts,
-    }
-
-
-def collect_diff_data(
-    repo: Path, merge_base_sha: str | None
-) -> tuple[list[dict[str, Any]], list[tuple[str, bytes]]]:
-    changes: list[dict[str, Any]] = []
-    parts: list[tuple[str, bytes]] = []
-    if merge_base_sha:
-        changes.extend(
-            parse_name_status(
-                run_git(repo, "diff", "--name-status", "-z", "-M", f"{merge_base_sha}..HEAD"),
-                "branch",
-            )
-        )
-        parts.append(
-            (
-                "branch",
-                run_git(
-                    repo,
-                    "diff",
-                    "--binary",
-                    "--full-index",
-                    "--no-ext-diff",
-                    f"{merge_base_sha}..HEAD",
-                ),
-            )
-        )
-    changes.extend(
-        parse_name_status(
-            run_git(repo, "diff", "--cached", "--name-status", "-z", "-M", "HEAD"),
-            "staged",
-        )
+def _run_bytes(repo: str, *args: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    proc = subprocess.run(
+        ["git", "-c", "core.quotepath=false", *args], cwd=repo,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
     )
-    changes.extend(
-        parse_name_status(
-            run_git(repo, "diff", "--name-status", "-z", "-M"), "unstaged"
-        )
-    )
-    changes.extend(untracked_changes(repo))
-    parts.extend(
-        [
-            (
-                "staged",
-                run_git(
-                    repo,
-                    "diff",
-                    "--cached",
-                    "--binary",
-                    "--full-index",
-                    "--no-ext-diff",
-                    "HEAD",
-                ),
-            ),
-            (
-                "unstaged",
-                run_git(
-                    repo,
-                    "diff",
-                    "--binary",
-                    "--full-index",
-                    "--no-ext-diff",
-                ),
-            ),
-        ]
-    )
-    return changes, parts
+    if check and proc.returncode:
+        raise GuardError(f"git {' '.join(args)} failed: {proc.stderr.decode('utf-8', 'replace').strip()}")
+    return proc
 
 
-def build_manifest(repo_arg: str, base: str | None, includes: list[str]) -> dict[str, Any]:
-    repo = normalize_repo(repo_arg)
-    head_sha = git_text(repo, "rev-parse", "HEAD")
-    merge_base_sha = git_text(repo, "merge-base", "HEAD", base) if base else None
-    status_raw = run_git(repo, "status", "--porcelain=v2", "-z", "--untracked-files=all")
-
-    changes, patch_parts = collect_diff_data(repo, merge_base_sha)
-
-    for include in includes:
-        path = normalize_path(include)
-        fingerprint = path_fingerprint(repo, path)
-        if fingerprint["kind"] == "missing":
-            raise GuardError(f"explicit scope path does not exist: {path}")
-        changes.append(
-            {
-                "layer": "explicit",
-                "change_type": "INSPECTED",
-                "status_code": "I",
-                "path": path,
-            }
-        )
-
-    changes.sort(key=lambda item: (item["path"], item["layer"], item["status_code"]))
-    aggregated: dict[str, dict[str, Any]] = {}
-    baseline_ref = merge_base_sha or head_sha
-    for change in changes:
-        path = change["path"]
-        entry = aggregated.setdefault(
-            path,
-            {
-                "path": path,
-                "layers": [],
-                "change_types": [],
-                "previous_paths": [],
-                "requires_full_content": False,
-            },
-        )
-        entry["layers"].append(change["layer"])
-        entry["change_types"].append(change["change_type"])
-        if old_path := change.get("old_path"):
-            entry["previous_paths"].append(old_path)
-        if change["change_type"] == "UNTRACKED":
-            entry["requires_full_content"] = True
-
-    scope_files: list[dict[str, Any]] = []
-    for path in sorted(aggregated):
-        entry = aggregated[path]
-        entry["layers"] = sorted(set(entry["layers"]))
-        entry["change_types"] = sorted(set(entry["change_types"]))
-        entry["previous_paths"] = sorted(set(entry["previous_paths"]))
-        entry["current"] = path_fingerprint(repo, path)
-        baseline_path = entry["previous_paths"][0] if entry["previous_paths"] else path
-        entry["baseline_sha256"] = baseline_fingerprint(repo, baseline_ref, baseline_path)
-        scope_files.append(entry)
-
-    diff = patch_stats(patch_parts)
-    manifest: dict[str, Any] = {
-        "protocol_version": PROTOCOL_VERSION,
-        "repository_root": str(repo),
-        "head_sha": head_sha,
-        "base_ref": base,
-        "merge_base_sha": merge_base_sha,
-        "status_porcelain_v2_sha256": sha256(status_raw),
-        "scope_complete": True,
-        "scope_empty": not scope_files,
-        "changes": changes,
-        "scope_files": scope_files,
-        "untracked_files": [
-            {
-                "path": entry["path"],
-                "size": entry["current"]["size"],
-                "sha256": entry["current"]["sha256"],
-            }
-            for entry in scope_files
-            if "UNTRACKED" in entry["change_types"]
-        ],
-        "diff": diff,
-    }
-
-    if git_text(repo, "rev-parse", "HEAD") != head_sha:
-        raise GuardError("HEAD changed while the manifest was being captured")
-    status_after = run_git(repo, "status", "--porcelain=v2", "-z", "--untracked-files=all")
-    if sha256(status_after) != sha256(status_raw):
-        raise GuardError("Git status changed while the manifest was being captured")
-    _, patch_parts_after = collect_diff_data(repo, merge_base_sha)
-    if patch_stats(patch_parts_after) != diff:
-        raise GuardError("diff changed while the manifest was being captured")
-    for entry in scope_files:
-        if path_fingerprint(repo, entry["path"]) != entry["current"]:
-            raise GuardError(
-                f"scope file changed while the manifest was being captured: {entry['path']}"
-            )
-
-    manifest["manifest_sha256"] = sha256(canonical_bytes(manifest))
-    return manifest
+def _zsplit(value: str) -> list[str]:
+    return [item for item in value.split("\0") if item]
 
 
-def load_json(path: str) -> Any:
-    try:
-        with Path(path).open("r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise GuardError(f"cannot load valid JSON from {path}: {exc}") from exc
+def _change_name(code: str) -> str:
+    names = {"A": "ADDED", "M": "MODIFIED", "D": "DELETED", "R": "RENAMED", "C": "COPIED"}
+    if code == "U":
+        raise GuardError("repository contains unresolved merge conflicts")
+    if code not in names:
+        raise GuardError(f"unsupported git status: {code}")
+    return names[code]
 
 
-def write_json(path: str | None, value: Any) -> None:
-    rendered = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    if path:
-        output = Path(path)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(rendered, encoding="utf-8")
-    else:
-        sys.stdout.write(rendered)
-
-
-def validate_manifest(manifest: Any) -> dict[str, Any]:
-    if not isinstance(manifest, dict):
-        raise GuardError("manifest must be a JSON object")
-    supplied_hash = manifest.get("manifest_sha256")
-    if not isinstance(supplied_hash, str):
-        raise GuardError("manifest_sha256 is missing")
-    unhashed = dict(manifest)
-    unhashed.pop("manifest_sha256", None)
-    if sha256(canonical_bytes(unhashed)) != supplied_hash:
-        raise GuardError("manifest_sha256 does not match manifest content")
-    if manifest.get("protocol_version") != PROTOCOL_VERSION:
-        raise GuardError("unsupported manifest protocol_version")
-    if manifest.get("scope_complete") is not True:
-        raise GuardError("manifest scope is not complete")
-    if not isinstance(manifest.get("scope_files"), list):
-        raise GuardError("manifest scope_files must be an array")
-    return manifest
-
-
-def validate_review_result(
-    result: Any, manifest: dict[str, Any], review_id: str, review_kind: str
-) -> dict[str, Any]:
-    if not isinstance(result, dict):
-        raise GuardError("review result must be a JSON object")
-    expected = {
-        "protocol_version": PROTOCOL_VERSION,
-        "reviewer_name": "adversarial_reviewer",
-        "review_id": review_id,
-        "review_kind": review_kind,
-        "status": "COMPLETED",
-        "scope_manifest_sha256": manifest["manifest_sha256"],
-    }
-    for key, value in expected.items():
-        if result.get(key) != value:
-            raise GuardError(f"review result {key} must equal {value!r}")
-    reviewed_paths = result.get("reviewed_paths")
-    if not isinstance(reviewed_paths, list) or any(
-        not isinstance(path, str) or not path for path in reviewed_paths
-    ):
-        raise GuardError("reviewed_paths must be a non-empty string array")
-    required_paths = {entry["path"] for entry in manifest["scope_files"]}
-    if not required_paths.issubset(set(reviewed_paths)):
-        missing = sorted(required_paths - set(reviewed_paths))
-        raise GuardError(f"reviewer did not attest to reviewing scope paths: {missing}")
-    summary = result.get("summary")
-    if not isinstance(summary, str) or not summary.strip():
-        raise GuardError("review summary must be non-empty")
-    findings = result.get("findings")
-    if not isinstance(findings, list):
-        raise GuardError("findings must be an array")
-    required_finding_fields = {
-        "id",
-        "severity",
-        "confidence",
-        "location",
-        "violated_contract",
-        "trigger",
-        "execution_path",
-        "actual",
-        "expected",
-        "regression_test",
-    }
-    seen_ids: set[str] = set()
-    for index, finding in enumerate(findings):
-        if not isinstance(finding, dict):
-            raise GuardError(f"finding {index} must be an object")
-        missing = required_finding_fields - finding.keys()
-        if missing:
-            raise GuardError(f"finding {index} is missing fields: {sorted(missing)}")
-        if not isinstance(finding["id"], str) or not finding["id"].strip():
-            raise GuardError(f"finding {index} has an invalid id")
-        if finding["id"] in seen_ids:
-            raise GuardError(f"duplicate finding id: {finding['id']}")
-        seen_ids.add(finding["id"])
-        if finding["severity"] not in SEVERITIES:
-            raise GuardError(f"finding {finding['id']} has an invalid severity")
-        confidence = finding["confidence"]
-        if not isinstance(confidence, int) or isinstance(confidence, bool) or not 0 <= confidence <= 100:
-            raise GuardError(f"finding {finding['id']} has an invalid confidence")
-        location = finding["location"]
-        if not isinstance(location, dict) or not isinstance(location.get("path"), str):
-            raise GuardError(f"finding {finding['id']} has an invalid location")
-        for field in required_finding_fields - {"id", "severity", "confidence", "location"}:
-            if not isinstance(finding[field], str) or not finding[field].strip():
-                raise GuardError(f"finding {finding['id']} has an empty {field}")
+def parse_name_status(raw: str, layer: str) -> list[dict[str, Any]]:
+    fields = _zsplit(raw)
+    result: list[dict[str, Any]] = []
+    i = 0
+    while i < len(fields):
+        status = fields[i]
+        i += 1
+        code = status[0]
+        if code in {"R", "C"}:
+            if i + 1 >= len(fields):
+                raise GuardError("malformed rename/copy status")
+            old_path, path = normalize_path(fields[i]), normalize_path(fields[i + 1])
+            i += 2
+            result.append({"path": path, "old_path": old_path, "layer": layer, "change_type": _change_name(code)})
+        else:
+            if i >= len(fields):
+                raise GuardError("malformed name-status output")
+            path = normalize_path(fields[i])
+            i += 1
+            result.append({"path": path, "layer": layer, "change_type": _change_name(code)})
     return result
 
 
-def assess_fix(
-    reviewed: dict[str, Any], current: dict[str, Any], semantic: list[str]
-) -> dict[str, Any]:
+def _check_repository(repo: str, base_range: str | None) -> None:
+    if _run(repo, "ls-files", "-u", "-z").stdout:
+        raise GuardError("repository contains unresolved merge conflicts")
+    checks = [("diff", "--check"), ("diff", "--cached", "--check", "HEAD")]
+    if base_range:
+        checks.append(("diff", "--check", base_range))
+    for args in checks:
+        proc = _run(repo, *args, check=False)
+        if proc.returncode:
+            detail = proc.stdout.strip() or proc.stderr.strip()
+            raise GuardError(f"git {' '.join(args)} failed: {detail}")
+
+
+SEMANTIC_PATTERNS: dict[str, re.Pattern[str]] = {
+    "public-api": re.compile(r"\b(export\s+|public\s+|__all__|module\.exports|exports\.|@app\.|router\.|Route\b)"),
+    "schema": re.compile(r"\b(CREATE|ALTER|DROP)\s+(TABLE|TYPE|INDEX)|\b(migration|schema)\b", re.I),
+    "persistence": re.compile(r"\b(repository|database|db\.|query\(|execute\(|Model\b|Entity\b|INSERT|UPDATE|DELETE)\b", re.I),
+    "concurrency": re.compile(r"\b(async|await|mutex|lock|semaphore|thread|atomic|synchronized|Promise\.all)\b", re.I),
+    "shared-state": re.compile(r"\b(global|singleton|shared|static\s+(?!final|const)|cache)\b", re.I),
+    "public-types": re.compile(r"\b(export\s+)?(interface|type|enum|class|struct)\s+\w+"),
+    "serialization": re.compile(r"\b(JSON\.|serialize|deserialize|marshal|unmarshal|to_dict|from_dict|serde)\b", re.I),
+}
+PATH_SEMANTICS = {
+    "api-routes": re.compile(r"(^|/)(api|routes?|controllers?)(/|\.)", re.I),
+    "schema": re.compile(r"(^|/)(migrations?|schema)(/|\.)", re.I),
+    "persistence": re.compile(r"(^|/)(models?|repositories|persistence|database|db)(/|\.)", re.I),
+}
+
+
+def semantic_fingerprints(repo: str, paths: Iterable[str]) -> dict[str, dict[str, str]]:
+    output: dict[str, dict[str, str]] = {}
+    root = Path(repo)
+    for rel in sorted(set(paths)):
+        path = root / rel
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (UnicodeDecodeError, OSError):
+            continue
+        matched: dict[str, list[str]] = {}
+        for category, pattern in SEMANTIC_PATTERNS.items():
+            selected = [line.strip() for line in lines if pattern.search(line)]
+            if selected:
+                matched[category] = selected
+        for category, pattern in PATH_SEMANTICS.items():
+            if pattern.search(rel):
+                matched.setdefault(category, []).append(f"FILE:{file_sha(path)}")
+        if matched:
+            output[rel] = {key: sha(value) for key, value in sorted(matched.items())}
+    return output
+
+
+def build_manifest(repo: str, base: str | None, includes: list[str], allow_empty: bool = False) -> dict[str, Any]:
+    requested = str(Path(repo).resolve())
+    repo = str(Path(_run(requested, "rev-parse", "--show-toplevel").stdout.strip()).resolve())
+    head = _run(repo, "rev-parse", "HEAD").stdout.strip()
+    merge_base = None
+    base_range = None
+    changes: list[dict[str, Any]] = []
+    if base:
+        merge_base = _run(repo, "merge-base", base, "HEAD").stdout.strip()
+        base_range = f"{merge_base}..HEAD"
+    _check_repository(repo, base_range)
+    if base_range:
+        changes += parse_name_status(_run(repo, "diff", "--name-status", "-z", "-M", base_range).stdout, "branch")
+    changes += parse_name_status(_run(repo, "diff", "--cached", "--name-status", "-z", "-M", "HEAD").stdout, "staged")
+    changes += parse_name_status(_run(repo, "diff", "--name-status", "-z", "-M").stdout, "unstaged")
+    for path in _zsplit(_run(repo, "ls-files", "--others", "--exclude-standard", "-z").stdout):
+        changes.append({"path": path, "layer": "untracked", "change_type": "UNTRACKED"})
+
+    for rel in map(normalize_path, includes):
+        changes.append({"path": rel, "layer": "explicit", "change_type": "INCLUDED"})
+    scope_paths = sorted({c["path"] for c in changes})
+    if not scope_paths and not allow_empty:
+        raise GuardError("review scope contains no files")
+
+    baseline_paths: dict[str, str | None] = {}
+    for c in changes:
+        if c.get("old_path"):
+            baseline_paths.setdefault(c["path"], c["old_path"])
+    scope_files = []
+    for rel in scope_paths:
+        current = Path(repo) / rel
+        baseline_path = baseline_paths.get(rel, rel)
+        baseline_ref = merge_base or "HEAD"
+        old = _run_bytes(repo, "show", f"{baseline_ref}:{baseline_path}", check=False)
+        baseline_sha = hashlib.sha256(old.stdout).hexdigest() if old.returncode == 0 else None
+        scope_files.append({
+            "path": rel,
+            "status": sorted({c["change_type"] for c in changes if c["path"] == rel}),
+            "current": path_fingerprint(Path(repo), rel),
+            "baseline_sha256": baseline_sha,
+        })
+    untracked = []
+    for c in changes:
+        if c["layer"] != "untracked":
+            continue
+        path = Path(repo) / c["path"]
+        if not path.is_file() or path.is_symlink():
+            raise GuardError(f"untracked scope entry is not a regular file: {c['path']}")
+        raw = path.read_bytes()
+        try:
+            text_utf8 = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text_utf8 = None
+        untracked.append({
+            "path": c["path"], "sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw),
+            "content_base64": base64.b64encode(raw).decode("ascii"),
+            "text_utf8": text_utf8,
+        })
+    diff_material = {
+        "branch": _run(repo, "diff", "--binary", base_range).stdout if base_range else "",
+        "staged": _run(repo, "diff", "--cached", "--binary", "HEAD").stdout,
+        "unstaged": _run(repo, "diff", "--binary").stdout,
+        "untracked": untracked,
+    }
+    manifest: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "head_sha": head,
+        "merge_base_sha": merge_base,
+        "base": base,
+        "changes": changes,
+        "scope_files": scope_files,
+        "scope_empty": not scope_files,
+        "scope_complete": True,
+        "untracked_files": untracked,
+        "git_status_sha256": hashlib.sha256(_run(repo, "status", "--porcelain=v2", "-z", "--untracked-files=all").stdout.encode()).hexdigest(),
+        "diff_sha256": sha(diff_material),
+        "diff_bytes": len(canonical(diff_material)),
+        "semantic_fingerprints": semantic_fingerprints(repo, scope_paths),
+    }
+    manifest["manifest_sha256"] = sha(manifest)
+    validate_manifest(manifest, allow_empty=allow_empty)
+    return manifest
+
+
+def validate_manifest(manifest: dict[str, Any], allow_empty: bool = False) -> dict[str, Any]:
+    if manifest.get("protocol_version") != PROTOCOL_VERSION:
+        raise GuardError("invalid manifest protocol")
+    if not manifest.get("scope_complete"):
+        raise GuardError("review scope is incomplete")
+    if (manifest.get("scope_empty") or not manifest.get("scope_files")) and not allow_empty:
+        raise GuardError("review scope is empty")
+    if any("UNMERGED" in item.get("status", []) for item in manifest.get("scope_files", [])):
+        raise GuardError("repository contains unresolved merge conflicts")
+    expected = dict(manifest)
+    actual = expected.pop("manifest_sha256", None)
+    if not actual or actual != sha(expected):
+        raise GuardError("manifest hash mismatch")
+    paths = [item.get("path") for item in manifest["scope_files"]]
+    if len(paths) != len(set(paths)) or any(not isinstance(p, str) or not p for p in paths):
+        raise GuardError("invalid scope paths")
+    if any(normalize_path(p) != p for p in paths):
+        raise GuardError("unsafe or non-canonical scope path")
+    return manifest
+
+
+def seal(receipt_type: str, fields: dict[str, Any]) -> dict[str, Any]:
+    receipt = {"protocol_version": PROTOCOL_VERSION, "receipt_type": receipt_type, **fields}
+    receipt["receipt_sha256"] = sha(receipt)
+    return receipt
+
+
+def validate_receipt(receipt: dict[str, Any], receipt_type: str) -> dict[str, Any]:
+    if receipt.get("protocol_version") != PROTOCOL_VERSION or receipt.get("receipt_type") != receipt_type:
+        raise GuardError(f"invalid {receipt_type} receipt")
+    body = dict(receipt)
+    actual = body.pop("receipt_sha256", None)
+    if not actual or actual != sha(body):
+        raise GuardError(f"{receipt_type} receipt hash mismatch")
+    return receipt
+
+
+def make_preflight_receipt(metadata: dict[str, Any]) -> dict[str, Any]:
+    required = {
+        "configured_agent_name": REVIEWER_NAME, "selected_agent_name": REVIEWER_NAME,
+        "config_status": "LOADED", "model": REVIEWER_MODEL, "model_status": "AVAILABLE",
+        "routing_status": "SELECTED", "spawn_status": "COMPLETED", "metadata_status": "AVAILABLE",
+        "followup_status": "SUPPORTED",
+    }
+    for key, expected in required.items():
+        if metadata.get(key) != expected:
+            raise GuardError(f"preflight cannot prove {key}={expected}")
+    if not str(metadata.get("config_path", "")).endswith("adversarial-reviewer.toml"):
+        raise GuardError("reviewer configuration was not proven loaded")
+    for key in ("probe_id", "thread_id", "spawn_id"):
+        if not isinstance(metadata.get(key), str) or not metadata[key]:
+            raise GuardError(f"preflight missing {key}")
+    return seal("preflight", {
+        "raw_metadata_sha256": sha(metadata), "probe_id": metadata["probe_id"],
+        "agent_name": REVIEWER_NAME, "model": REVIEWER_MODEL,
+        "thread_id": metadata["thread_id"], "spawn_id": metadata["spawn_id"],
+    })
+
+
+def make_turn_receipt(metadata: dict[str, Any], preflight: dict[str, Any]) -> dict[str, Any]:
+    validate_receipt(preflight, "preflight")
+    sequence = metadata.get("sequence")
+    if not isinstance(sequence, int) or sequence < 1:
+        raise GuardError("invalid review sequence")
+    expected_mode = "SPAWN" if sequence == 1 else "FOLLOWUP"
+    checks = {
+        "agent_name": preflight["agent_name"], "model": preflight["model"],
+        "thread_id": preflight["thread_id"], "turn_mode": expected_mode,
+        "delivery_status": "DELIVERED", "completion_status": "COMPLETED", "result_status": "RECEIVED",
+    }
+    for key, expected in checks.items():
+        if metadata.get(key) != expected:
+            raise GuardError(f"review turn cannot prove {key}={expected}")
+    for key in ("turn_id", "review_id"):
+        if not isinstance(metadata.get(key), str) or not metadata[key]:
+            raise GuardError(f"review turn missing {key}")
+    kind = metadata.get("review_kind")
+    if kind not in {"FULL", "INCREMENTAL"} or (sequence == 1 and kind != "FULL"):
+        raise GuardError("invalid review kind")
+    parent = metadata.get("parent_review_id")
+    if sequence == 1 and parent is not None or sequence > 1 and not parent:
+        raise GuardError("invalid review parent")
+    return seal("review-turn", {
+        "raw_metadata_sha256": sha(metadata), "preflight_receipt_sha256": preflight["receipt_sha256"],
+        "turn_id": metadata["turn_id"], "review_id": metadata["review_id"], "review_kind": kind,
+        "sequence": sequence, "parent_review_id": parent, "thread_id": metadata["thread_id"],
+        "agent_name": metadata["agent_name"], "model": metadata["model"],
+    })
+
+
+def make_snapshot_receipt(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    validate_manifest(before)
+    validate_manifest(after)
+    return seal("snapshot-compare", {
+        "before_manifest_sha256": before["manifest_sha256"],
+        "after_manifest_sha256": after["manifest_sha256"],
+        "match": before["manifest_sha256"] == after["manifest_sha256"],
+    })
+
+
+def _finding_hashes(findings: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return [{"finding_id": item["id"], "finding_content_sha256": sha(item)} for item in findings]
+
+
+def validate_review_result(result: dict[str, Any], manifest: dict[str, Any], turn: dict[str, Any] | None = None) -> dict[str, Any]:
+    validate_manifest(manifest)
+    if result.get("protocol_version") != PROTOCOL_VERSION or result.get("reviewer_name") != REVIEWER_NAME:
+        raise GuardError("wrong or missing reviewer identity")
+    if result.get("status") != "COMPLETED":
+        raise GuardError("reviewer did not complete")
+    if result.get("scope_manifest_sha256") != manifest["manifest_sha256"]:
+        raise GuardError("review result targets a different manifest")
+    if turn:
+        validate_receipt(turn, "review-turn")
+        for key in ("review_id", "review_kind", "sequence", "parent_review_id"):
+            if result.get(key) != turn.get(key):
+                raise GuardError(f"review result does not match turn {key}")
+    required_paths = {item["path"] for item in manifest["scope_files"]}
+    reviewed = result.get("reviewed_paths")
+    if not isinstance(reviewed, list) or not required_paths.issubset(set(reviewed)):
+        raise GuardError("review result does not cover every scope path")
+    findings = result.get("findings")
+    verifications = result.get("finding_verifications")
+    if not isinstance(findings, list) or not isinstance(verifications, list) or not isinstance(result.get("summary"), str):
+        raise GuardError("invalid reviewer result format")
+    ids: set[str] = set()
+    for finding in findings:
+        required = {"id", "severity", "confidence", "location", "violated_contract", "trigger", "execution_path", "actual", "expected", "regression_test"}
+        if not required.issubset(finding) or finding["severity"] not in SEVERITIES or not isinstance(finding["location"], dict):
+            raise GuardError("invalid finding")
+        if not finding["id"] or finding["id"] in ids:
+            raise GuardError("duplicate or empty finding id")
+        ids.add(finding["id"])
+    verification_ids: set[str] = set()
+    for item in verifications:
+        required = {"finding_id", "origin_result_sha256", "status", "evidence", "regression_test_verified"}
+        if not required.issubset(item) or item["status"] not in VERIFICATIONS or not isinstance(item["regression_test_verified"], bool):
+            raise GuardError("invalid finding verification")
+        if not item["finding_id"] or item["finding_id"] in verification_ids or not item["origin_result_sha256"]:
+            raise GuardError("duplicate or incomplete finding verification")
+        verification_ids.add(item["finding_id"])
+    return result
+
+
+def make_result_receipt(result: dict[str, Any], manifest: dict[str, Any], preflight: dict[str, Any], turn: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    validate_receipt(preflight, "preflight")
+    validate_receipt(turn, "review-turn")
+    validate_receipt(snapshot, "snapshot-compare")
+    if turn["preflight_receipt_sha256"] != preflight["receipt_sha256"]:
+        raise GuardError("turn is linked to another preflight")
+    target_manifest = manifest.get("manifest_sha256")
+    if not snapshot["match"] or snapshot["before_manifest_sha256"] != target_manifest or snapshot["after_manifest_sha256"] != target_manifest:
+        raise GuardError("worktree changed during review")
+    validate_review_result(result, manifest, turn)
+    result_hash = sha(result)
+    finding_hashes = _finding_hashes(result["findings"])
+    return seal("review-result", {
+        "result_sha256": result_hash, "review_id": result["review_id"], "review_kind": result["review_kind"],
+        "sequence": result["sequence"], "parent_review_id": result["parent_review_id"],
+        "reviewer_name": result["reviewer_name"], "manifest_sha256": manifest["manifest_sha256"],
+        "thread_id": turn["thread_id"], "turn_receipt_sha256": turn["receipt_sha256"],
+        "snapshot_receipt_sha256": snapshot["receipt_sha256"], "finding_ids": [x["finding_id"] for x in finding_hashes],
+        "finding_hashes": finding_hashes, "findings_sha256": sha(finding_hashes),
+        "verification_ids": [x["finding_id"] for x in result["finding_verifications"]],
+        "verifications_sha256": sha(result["finding_verifications"]),
+    })
+
+
+def make_validation_receipt(raw: dict[str, Any]) -> dict[str, Any]:
+    commands = raw.get("commands")
+    if not isinstance(commands, list) or not commands:
+        raise GuardError("validation has no commands")
+    status = "PASSED"
+    for item in commands:
+        if not {"command", "exit_code", "output_sha256", "scope", "outcome"}.issubset(item):
+            raise GuardError("invalid validation command")
+        if item["outcome"] not in {"PASSED", "FAILED", "INCONCLUSIVE"}:
+            raise GuardError("invalid validation outcome")
+        if item["outcome"] == "INCONCLUSIVE":
+            status = "INCONCLUSIVE"
+        elif status != "INCONCLUSIVE" and (item["outcome"] == "FAILED" or item["exit_code"] != 0):
+            status = "FAILED"
+    return seal("deterministic-validation", {"raw_validation_sha256": sha(raw), "status": status, "commands_sha256": sha(commands)})
+
+
+def make_final_manifest_receipt(manifest: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    validate_manifest(manifest)
+    validate_receipt(snapshot, "snapshot-compare")
+    target = manifest["manifest_sha256"]
+    if not snapshot["match"] or snapshot["before_manifest_sha256"] != target or snapshot["after_manifest_sha256"] != target:
+        raise GuardError("final manifest snapshot does not match")
+    return seal("final-manifest", {"manifest_sha256": target, "snapshot_receipt_sha256": snapshot["receipt_sha256"]})
+
+
+def assess_fix(before: dict[str, Any], after: dict[str, Any], semantics: list[str]) -> dict[str, Any]:
+    validate_manifest(before)
+    validate_manifest(after)
     reasons: list[str] = []
-    reviewed_paths = {entry["path"] for entry in reviewed["scope_files"]}
-    current_paths = {entry["path"] for entry in current["scope_files"]}
-    new_paths = sorted(current_paths - reviewed_paths)
+    before_paths = {item["path"] for item in before["scope_files"]}
+    after_paths = {item["path"] for item in after["scope_files"]}
+    new_paths = sorted(after_paths - before_paths)
     if new_paths:
-        reasons.append("previously-unreviewed-paths:" + ",".join(new_paths))
-
-    added_after_review = sorted(
-        entry["path"]
-        for entry in current["scope_files"]
-        if entry["path"] not in reviewed_paths
-        and ({"ADDED", "UNTRACKED"} & set(entry["change_types"]))
-    )
-    if added_after_review:
-        reasons.append("new-files:" + ",".join(added_after_review))
-    if current.get("head_sha") != reviewed.get("head_sha"):
+        reasons.append("new-files:" + ",".join(new_paths))
+    if before["head_sha"] != after["head_sha"]:
         reasons.append("head-changed")
-
-    before_lines = int(reviewed.get("diff", {}).get("changed_lines", 0))
-    after_lines = int(current.get("diff", {}).get("changed_lines", 0))
-    growth_limit = before_lines + max(200, math.ceil(before_lines * 0.5))
-    if after_lines > growth_limit:
-        reasons.append(f"significant-diff-growth:{before_lines}->{after_lines}")
-
-    invalid_semantic = set(semantic) - SEMANTIC_ESCALATIONS
-    if invalid_semantic:
-        raise GuardError(f"unsupported semantic escalation: {sorted(invalid_semantic)}")
-    reasons.extend(f"semantic:{item}" for item in sorted(set(semantic)))
+    if after.get("diff_bytes", 0) > max(4096, int(before.get("diff_bytes", 0) * 1.75)):
+        reasons.append("significant-diff-growth")
+    before_fp = before.get("semantic_fingerprints", {})
+    after_fp = after.get("semantic_fingerprints", {})
+    for path in sorted(set(before_fp) | set(after_fp)):
+        categories = set(before_fp.get(path, {})) | set(after_fp.get(path, {}))
+        for category in sorted(categories):
+            if before_fp.get(path, {}).get(category) != after_fp.get(path, {}).get(category):
+                reasons.append(f"auto-semantic:{category}:{path}")
+    reasons.extend(f"semantic:{item}" for item in semantics)
+    reasons = list(dict.fromkeys(reasons))
     return {"full_review_required": bool(reasons), "reasons": reasons}
 
 
-def decide_state(payload: Any) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        raise GuardError("decision input must be a JSON object")
-    integrity = payload.get("integrity")
-    if not isinstance(integrity, dict):
-        raise GuardError("decision input integrity must be an object")
-    required_integrity = {
-        "reviewer_spawned",
-        "correct_reviewer",
-        "reviewer_completed",
-        "result_valid",
-        "scope_complete",
-        "worktree_unchanged",
-        "final_version_reviewed",
-        "followups_delivered",
-    }
-    inconclusive_reasons = [
-        f"integrity:{key}"
-        for key in sorted(required_integrity)
-        if integrity.get(key) is not True
-    ]
+def make_escalation_receipt(before: dict[str, Any], after: dict[str, Any], semantics: list[str]) -> dict[str, Any]:
+    assessment = assess_fix(before, after, semantics)
+    return seal("fix-escalation", {
+        "before_manifest_sha256": before["manifest_sha256"], "after_manifest_sha256": after["manifest_sha256"],
+        **assessment,
+    })
 
-    validation = payload.get("validation")
-    if validation not in {"PASSED", "FAILED", "INCONCLUSIVE"}:
-        inconclusive_reasons.append("validation:missing-or-invalid")
-    elif validation == "INCONCLUSIVE":
-        inconclusive_reasons.append("validation:inconclusive")
 
-    escalation = payload.get("escalation", {})
-    if not isinstance(escalation, dict):
-        inconclusive_reasons.append("escalation:invalid")
-    elif escalation.get("required") is True and escalation.get("full_review_completed") is not True:
-        inconclusive_reasons.append("escalation:full-review-not-completed")
+def _index_by(items: list[dict[str, Any]], key: str, label: str) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for item in items:
+        value = item.get(key)
+        if not isinstance(value, str) or not value or value in result:
+            raise GuardError(f"duplicate or missing {label} {key}")
+        result[value] = item
+    return result
 
-    findings = payload.get("findings")
-    if not isinstance(findings, list):
-        inconclusive_reasons.append("findings:missing-or-invalid")
-        findings = []
 
-    confirmed_blocking: list[str] = []
-    for index, finding in enumerate(findings):
-        if not isinstance(finding, dict):
-            inconclusive_reasons.append(f"finding:{index}:invalid")
-            continue
-        finding_id = str(finding.get("id", index))
-        severity = finding.get("severity")
-        classification = finding.get("classification")
-        if severity not in SEVERITIES or classification not in CLASSIFICATIONS:
-            inconclusive_reasons.append(f"finding:{finding_id}:unclassified")
-            continue
-        if classification == "CONFIRMED" and severity in BLOCKING_SEVERITIES:
-            confirmed_blocking.append(finding_id)
-        if classification == "UNCERTAIN" and severity in {"CRITICAL", "HIGH"}:
-            inconclusive_reasons.append(f"finding:{finding_id}:uncertain-{severity.lower()}")
-        if classification == "REJECTED" and severity in {"CRITICAL", "HIGH"}:
-            evidence = finding.get("rejection_evidence")
-            if (
-                not isinstance(evidence, dict)
-                or evidence.get("type") not in REJECTION_EVIDENCE_TYPES
-                or not isinstance(evidence.get("reference"), str)
-                or not evidence["reference"].strip()
-                or not isinstance(evidence.get("details"), str)
-                or not evidence["details"].strip()
-            ):
-                inconclusive_reasons.append(
-                    f"finding:{finding_id}:rejection-lacks-objective-evidence"
-                )
+def decide_from_artifacts(
+    results: list[dict[str, Any]], manifests: list[dict[str, Any]], result_receipts: list[dict[str, Any]],
+    classifications: dict[str, Any], validation_receipt: dict[str, Any], final_manifest: dict[str, Any],
+    final_manifest_receipt: dict[str, Any], escalation_receipts: list[dict[str, Any]],
+    preflight_receipt: dict[str, Any], turn_receipts: list[dict[str, Any]], snapshot_receipts: list[dict[str, Any]],
+    max_full_reviews: int = 2, max_incremental_reviews: int = 2,
+) -> dict[str, Any]:
+    """Derive final state. Any broken evidence chain is INCONCLUSIVE."""
+    try:
+        for m in manifests:
+            validate_manifest(m)
+        validate_manifest(final_manifest)
+        validate_receipt(preflight_receipt, "preflight")
+        if preflight_receipt.get("agent_name") != REVIEWER_NAME or preflight_receipt.get("model") != REVIEWER_MODEL or not preflight_receipt.get("thread_id"):
+            raise GuardError("preflight does not prove the required custom reviewer")
+        validate_receipt(validation_receipt, "deterministic-validation")
+        validate_receipt(final_manifest_receipt, "final-manifest")
+        for receipt in turn_receipts:
+            validate_receipt(receipt, "review-turn")
+        for receipt in snapshot_receipts:
+            validate_receipt(receipt, "snapshot-compare")
+        for receipt in result_receipts:
+            validate_receipt(receipt, "review-result")
+        for receipt in escalation_receipts:
+            validate_receipt(receipt, "fix-escalation")
 
-    if inconclusive_reasons:
-        state = "INCONCLUSIVE"
-    elif validation == "FAILED" or confirmed_blocking:
-        state = "FAIL"
-    else:
+        manifest_by_hash = _index_by(manifests, "manifest_sha256", "manifest")
+        receipt_by_result = _index_by(result_receipts, "result_sha256", "result receipt")
+        turn_by_hash = _index_by(turn_receipts, "receipt_sha256", "turn receipt")
+        snapshot_by_hash = _index_by(snapshot_receipts, "receipt_sha256", "snapshot receipt")
+        if len(results) != len(result_receipts) or not results:
+            raise GuardError("every original reviewer result must have exactly one receipt")
+        if len(turn_receipts) != len(result_receipts):
+            raise GuardError("every reviewer result must have exactly one turn receipt")
+        ordered = sorted(results, key=lambda item: item.get("sequence", 0))
+        if [x.get("sequence") for x in ordered] != list(range(1, len(ordered) + 1)):
+            raise GuardError("review sequence is not contiguous")
+        if ordered[0].get("review_kind") != "FULL" or ordered[0].get("parent_review_id") is not None:
+            raise GuardError("review chain must begin with a full review")
+        if sum(x.get("review_kind") == "FULL" for x in ordered) > max_full_reviews or sum(x.get("review_kind") == "INCREMENTAL" for x in ordered) > max_incremental_reviews:
+            raise GuardError("review budget exceeded")
+
+        findings: dict[str, dict[str, Any]] = {}
+        verifications: dict[tuple[str, str], dict[str, Any]] = {}
+        reviews: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        previous_id = None
+        thread_id = None
+        for result in ordered:
+            result_hash = sha(result)
+            receipt = receipt_by_result.get(result_hash)
+            if not receipt:
+                raise GuardError("original reviewer result is missing its validated receipt")
+            manifest = manifest_by_hash.get(receipt["manifest_sha256"])
+            if not manifest:
+                raise GuardError("review manifest is missing")
+            validate_review_result(result, manifest)
+            finding_hashes = _finding_hashes(result["findings"])
+            receipt_checks = {
+                "review_id": result["review_id"], "review_kind": result["review_kind"],
+                "sequence": result["sequence"], "parent_review_id": result["parent_review_id"],
+                "reviewer_name": result["reviewer_name"], "manifest_sha256": result["scope_manifest_sha256"],
+                "finding_ids": [x["finding_id"] for x in finding_hashes], "finding_hashes": finding_hashes,
+                "findings_sha256": sha(finding_hashes),
+                "verification_ids": [x["finding_id"] for x in result["finding_verifications"]],
+                "verifications_sha256": sha(result["finding_verifications"]),
+            }
+            if any(receipt.get(key) != expected for key, expected in receipt_checks.items()):
+                raise GuardError("review result receipt does not match original result")
+            turn = turn_by_hash.get(receipt.get("turn_receipt_sha256"))
+            snapshot = snapshot_by_hash.get(receipt.get("snapshot_receipt_sha256"))
+            if not turn or turn.get("preflight_receipt_sha256") != preflight_receipt["receipt_sha256"]:
+                raise GuardError("review result is not linked to the validated custom-agent preflight")
+            if any(turn.get(key) != result.get(key) for key in ("review_id", "review_kind", "sequence", "parent_review_id")):
+                raise GuardError("review result is not linked to its completed turn")
+            if turn.get("agent_name") != REVIEWER_NAME or turn.get("model") != REVIEWER_MODEL:
+                raise GuardError("review turn used the wrong custom reviewer")
+            if not snapshot or not snapshot.get("match") or snapshot.get("before_manifest_sha256") != manifest["manifest_sha256"] or snapshot.get("after_manifest_sha256") != manifest["manifest_sha256"]:
+                raise GuardError("reviewer changed the worktree or reviewed a different snapshot")
+            if previous_id is not None and result.get("parent_review_id") != previous_id:
+                raise GuardError("review follow-up chain is broken")
+            if thread_id is None:
+                thread_id = receipt["thread_id"]
+            elif receipt["thread_id"] != thread_id:
+                raise GuardError("follow-up used a different reviewer thread")
+            previous_id = result["review_id"]
+            reviews[result["review_id"]] = (result, receipt)
+            for finding in result["findings"]:
+                if finding["id"] in findings:
+                    raise GuardError("finding id was reused or mutated")
+                findings[finding["id"]] = {
+                    "finding": finding, "origin_review_id": result["review_id"], "origin_result_sha256": result_hash,
+                    "origin_manifest_sha256": result["scope_manifest_sha256"], "finding_content_sha256": sha(finding),
+                }
+            for item in result["finding_verifications"]:
+                if item["finding_id"] not in findings or findings[item["finding_id"]]["origin_result_sha256"] != item["origin_result_sha256"]:
+                    raise GuardError("verification has no immutable origin")
+                if findings[item["finding_id"]]["origin_review_id"] == result["review_id"]:
+                    raise GuardError("a finding cannot verify itself in its origin review")
+                verifications[(result["review_id"], item["finding_id"])] = item
+
+        if final_manifest_receipt["manifest_sha256"] != final_manifest["manifest_sha256"]:
+            raise GuardError("final manifest receipt mismatch")
+        final_snapshot = snapshot_by_hash.get(final_manifest_receipt.get("snapshot_receipt_sha256"))
+        if not final_snapshot or not final_snapshot.get("match") or final_snapshot.get("before_manifest_sha256") != final_manifest["manifest_sha256"] or final_snapshot.get("after_manifest_sha256") != final_manifest["manifest_sha256"]:
+            raise GuardError("final manifest is not backed by an unchanged snapshot")
+        last_result, last_receipt = reviews[ordered[-1]["review_id"]]
+        if last_receipt["manifest_sha256"] != final_manifest["manifest_sha256"]:
+            raise GuardError("final version was not reviewed")
+
+        lifecycle_list = classifications.get("findings")
+        if classifications.get("protocol_version") != PROTOCOL_VERSION or not isinstance(lifecycle_list, list):
+            raise GuardError("invalid classification artifact")
+        lifecycle = _index_by(lifecycle_list, "finding_id", "classification")
+        if set(lifecycle) != set(findings):
+            raise GuardError("a validated reviewer finding was omitted or invented")
+
+        escalation_by_pair = {
+            (r["before_manifest_sha256"], r["after_manifest_sha256"]): r for r in escalation_receipts
+        }
         state = "PASS"
-    return {
-        "state": state,
-        "inconclusive_reasons": sorted(set(inconclusive_reasons)),
-        "confirmed_blocking": confirmed_blocking,
-    }
+        reasons: list[str] = []
+        output_lifecycle: list[dict[str, Any]] = []
+        for fid, origin in findings.items():
+            finding = origin["finding"]
+            entry = lifecycle[fid]
+            immutable = {
+                "origin_review_id": origin["origin_review_id"], "origin_result_sha256": origin["origin_result_sha256"],
+                "origin_manifest_sha256": origin["origin_manifest_sha256"], "original_severity": finding["severity"],
+                "finding_content_sha256": origin["finding_content_sha256"],
+            }
+            if any(entry.get(k) != v for k, v in immutable.items()):
+                raise GuardError(f"immutable finding history changed for {fid}")
+            classification, resolution = entry.get("classification"), entry.get("resolution")
+            allowed = {("CONFIRMED", "OPEN"), ("CONFIRMED", "FIXED"), ("REJECTED", "NOT_APPLICABLE"), ("UNCERTAIN", "OPEN")}
+            if classification not in CLASSIFICATIONS or resolution not in RESOLUTIONS or (classification, resolution) not in allowed:
+                raise GuardError(f"invalid lifecycle state for {fid}")
+            evidence = entry.get("classification_evidence")
+            if not isinstance(evidence, dict) or not all(evidence.get(k) for k in ("type", "reference", "details")):
+                raise GuardError(f"missing classification evidence for {fid}")
+            severity = finding["severity"]
+            if classification == "REJECTED" and severity in {"CRITICAL", "HIGH"}:
+                evidence_type = evidence.get("type")
+                proof = evidence.get("proof")
+                if evidence_type not in EVIDENCE_TYPES or not isinstance(proof, dict):
+                    raise GuardError(f"rejected {severity} finding lacks objective evidence")
+                if evidence_type in {"executable_reproduction", "passing_regression_test"}:
+                    if proof.get("validation_receipt_sha256") != validation_receipt["receipt_sha256"] or validation_receipt["status"] != "PASSED":
+                        raise GuardError(f"rejected {severity} finding has no passing validation proof")
+                else:
+                    proof_manifest = manifest_by_hash.get(proof.get("manifest_sha256"))
+                    proof_path = proof.get("path")
+                    proof_content = proof.get("content_sha256")
+                    matched_file = next((x for x in proof_manifest.get("scope_files", []) if x.get("path") == proof_path), None) if proof_manifest else None
+                    valid_hashes = {matched_file.get("baseline_sha256"), matched_file.get("current", {}).get("sha256")} if matched_file else set()
+                    if not proof_manifest or not matched_file or not proof_content or proof_content not in valid_hashes:
+                        raise GuardError(f"rejected {severity} finding has no hash-linked repository proof")
+            if classification == "UNCERTAIN" and severity in {"CRITICAL", "HIGH"}:
+                state = "INCONCLUSIVE"
+                reasons.append(f"{fid} is uncertain {severity}")
+            elif classification == "CONFIRMED" and resolution == "OPEN" and severity in BLOCKING:
+                if state != "INCONCLUSIVE":
+                    state = "FAIL"
+                reasons.append(f"{fid} remains confirmed and open")
+            elif classification == "CONFIRMED" and resolution == "FIXED":
+                fix_manifest = entry.get("fixed_in_manifest_sha256")
+                review_id = entry.get("verified_by_review_id")
+                verified_result_hash = entry.get("verified_by_result_sha256")
+                regression = entry.get("regression_validation")
+                if not all((fix_manifest, review_id, verified_result_hash)) or not isinstance(regression, dict):
+                    raise GuardError(f"fixed finding {fid} has an incomplete proof chain")
+                verification_review = reviews.get(review_id)
+                if not verification_review:
+                    raise GuardError(f"fixed finding {fid} references an unknown review")
+                verify_result, verify_receipt = verification_review
+                if verify_receipt["result_sha256"] != verified_result_hash or verify_receipt["manifest_sha256"] != fix_manifest:
+                    raise GuardError(f"fixed finding {fid} verification hashes do not match")
+                if verify_result["sequence"] <= reviews[origin["origin_review_id"]][0]["sequence"]:
+                    raise GuardError(f"fixed finding {fid} was not re-reviewed later")
+                verification = verifications.get((review_id, fid))
+                if not verification:
+                    raise GuardError(f"re-review omitted verification for {fid}")
+                if verification["status"] == "STILL_PRESENT":
+                    if state != "INCONCLUSIVE":
+                        state = "FAIL"
+                    reasons.append(f"{fid} is still present")
+                elif verification["status"] == "UNRESOLVED":
+                    if severity in {"CRITICAL", "HIGH"}:
+                        state = "INCONCLUSIVE"
+                    elif state != "INCONCLUSIVE":
+                        state = "FAIL"
+                    reasons.append(f"{fid} verification is unresolved")
+                elif not verification["regression_test_verified"]:
+                    raise GuardError(f"fixed finding {fid} lacks reviewer regression verification")
+                if regression.get("validation_receipt_sha256") != validation_receipt["receipt_sha256"] or validation_receipt["status"] != "PASSED":
+                    raise GuardError(f"fixed finding {fid} lacks passing deterministic validation")
+                escalation = escalation_by_pair.get((origin["origin_manifest_sha256"], fix_manifest))
+                if not escalation:
+                    raise GuardError(f"fixed finding {fid} lacks escalation assessment")
+                if escalation["full_review_required"] and verify_result["review_kind"] != "FULL":
+                    state = "INCONCLUSIVE"
+                    full_count = sum(x.get("review_kind") == "FULL" for x in ordered)
+                    suffix = "; full-review budget exhausted" if full_count >= max_full_reviews else ""
+                    reasons.append(f"{fid} required a full re-review{suffix}")
+            output_lifecycle.append({"finding_id": fid, **immutable, "classification": classification, "resolution": resolution})
+
+        if validation_receipt["status"] == "INCONCLUSIVE":
+            state = "INCONCLUSIVE"
+            reasons.append("deterministic validation is inconclusive")
+        elif validation_receipt["status"] == "FAILED" and state != "INCONCLUSIVE":
+            state = "FAIL"
+            reasons.append("deterministic validation failed")
+        return {"state": state, "reasons": reasons, "finding_lifecycle": output_lifecycle}
+    except GuardError as exc:
+        return {"state": "INCONCLUSIVE", "reasons": [str(exc)], "finding_lifecycle": []}
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    subparsers = parser.add_subparsers(dest="command", required=True)
+def _load(path: str) -> Any:
+    with open(path, encoding="utf-8") as stream:
+        return json.load(stream)
 
-    capture = subparsers.add_parser("capture", help="capture a frozen change manifest")
-    capture.add_argument("--repo", default=".")
-    capture.add_argument("--base")
-    capture.add_argument("--include", action="append", default=[])
-    capture.add_argument("--output", required=True)
 
-    compare = subparsers.add_parser("compare", help="compare two frozen manifests")
-    compare.add_argument("--before", required=True)
-    compare.add_argument("--after", required=True)
-
-    validate_result_parser = subparsers.add_parser(
-        "validate-result", help="validate the exact reviewer JSON envelope"
-    )
-    validate_result_parser.add_argument("--input", required=True)
-    validate_result_parser.add_argument("--manifest", required=True)
-    validate_result_parser.add_argument("--review-id", required=True)
-    validate_result_parser.add_argument(
-        "--review-kind", required=True, choices=["FULL", "INCREMENTAL"]
-    )
-
-    assess = subparsers.add_parser(
-        "assess-fix", help="decide whether a fix requires a new full review"
-    )
-    assess.add_argument("--reviewed", required=True)
-    assess.add_argument("--current", required=True)
-    assess.add_argument("--semantic", action="append", default=[])
-
-    decide = subparsers.add_parser("decide", help="compute PASS, FAIL, or INCONCLUSIVE")
-    decide.add_argument("--input", required=True)
-    return parser
+def _dump(value: Any) -> None:
+    json.dump(value, sys.stdout, indent=2, sort_keys=True, ensure_ascii=True)
+    sys.stdout.write("\n")
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command", required=True)
+    capture = commands.add_parser("capture")
+    capture.add_argument("--repo", default=".")
+    capture.add_argument("--base")
+    capture.add_argument("--include", action="append", default=[])
+    capture.add_argument("--allow-empty", action="store_true")
+    preflight = commands.add_parser("preflight-receipt")
+    preflight.add_argument("--metadata", required=True)
+    turn = commands.add_parser("turn-receipt")
+    turn.add_argument("--metadata", required=True)
+    turn.add_argument("--preflight", required=True)
+    compare = commands.add_parser("compare")
+    compare.add_argument("--before", required=True)
+    compare.add_argument("--after", required=True)
+    result = commands.add_parser("validate-result")
+    for name in ("result", "manifest", "preflight", "turn", "snapshot"):
+        result.add_argument(f"--{name}", required=True)
+    validation = commands.add_parser("validation-receipt")
+    validation.add_argument("--validation", required=True)
+    final = commands.add_parser("final-manifest-receipt")
+    final.add_argument("--manifest", required=True)
+    final.add_argument("--snapshot", required=True)
+    assess = commands.add_parser("assess-fix")
+    assess.add_argument("--before", required=True)
+    assess.add_argument("--after", required=True)
+    assess.add_argument("--semantic", action="append", default=[])
+    decide = commands.add_parser("decide")
+    decide.add_argument("--result", action="append", required=True)
+    decide.add_argument("--manifest", action="append", required=True)
+    decide.add_argument("--result-receipt", action="append", required=True)
+    decide.add_argument("--classifications", required=True)
+    decide.add_argument("--validation-receipt", required=True)
+    decide.add_argument("--final-manifest", required=True)
+    decide.add_argument("--final-manifest-receipt", required=True)
+    decide.add_argument("--escalation-receipt", action="append", default=[])
+    decide.add_argument("--preflight-receipt", required=True)
+    decide.add_argument("--turn-receipt", action="append", required=True)
+    decide.add_argument("--snapshot-receipt", action="append", required=True)
+    decide.add_argument("--max-full-reviews", type=int, default=2)
+    decide.add_argument("--max-incremental-reviews", type=int, default=2)
+    args = parser.parse_args()
     try:
         if args.command == "capture":
-            write_json(args.output, build_manifest(args.repo, args.base, args.include))
-            return 0
-        if args.command == "compare":
-            before = validate_manifest(load_json(args.before))
-            after = validate_manifest(load_json(args.after))
-            match = before["manifest_sha256"] == after["manifest_sha256"]
-            write_json(
-                None,
-                {
-                    "match": match,
-                    "before": before["manifest_sha256"],
-                    "after": after["manifest_sha256"],
-                },
+            value = build_manifest(args.repo, args.base, args.include, args.allow_empty)
+        elif args.command == "preflight-receipt":
+            value = make_preflight_receipt(_load(args.metadata))
+        elif args.command == "turn-receipt":
+            value = make_turn_receipt(_load(args.metadata), _load(args.preflight))
+        elif args.command == "compare":
+            value = make_snapshot_receipt(_load(args.before), _load(args.after))
+        elif args.command == "validate-result":
+            value = make_result_receipt(_load(args.result), _load(args.manifest), _load(args.preflight), _load(args.turn), _load(args.snapshot))
+        elif args.command == "validation-receipt":
+            value = make_validation_receipt(_load(args.validation))
+        elif args.command == "final-manifest-receipt":
+            value = make_final_manifest_receipt(_load(args.manifest), _load(args.snapshot))
+        elif args.command == "assess-fix":
+            value = make_escalation_receipt(_load(args.before), _load(args.after), args.semantic)
+        else:
+            value = decide_from_artifacts(
+                [_load(p) for p in args.result], [_load(p) for p in args.manifest], [_load(p) for p in args.result_receipt],
+                _load(args.classifications), _load(args.validation_receipt), _load(args.final_manifest),
+                _load(args.final_manifest_receipt), [_load(p) for p in args.escalation_receipt],
+                _load(args.preflight_receipt), [_load(p) for p in args.turn_receipt], [_load(p) for p in args.snapshot_receipt],
+                args.max_full_reviews, args.max_incremental_reviews,
             )
-            return 0 if match else 3
-        if args.command == "validate-result":
-            manifest = validate_manifest(load_json(args.manifest))
-            result = validate_review_result(
-                load_json(args.input), manifest, args.review_id, args.review_kind
-            )
-            write_json(
-                None,
-                {
-                    "valid": True,
-                    "result_sha256": sha256(canonical_bytes(result)),
-                    "findings": len(result["findings"]),
-                },
-            )
-            return 0
-        if args.command == "assess-fix":
-            reviewed = validate_manifest(load_json(args.reviewed))
-            current = validate_manifest(load_json(args.current))
-            write_json(None, assess_fix(reviewed, current, args.semantic))
-            return 0
-        if args.command == "decide":
-            write_json(None, decide_state(load_json(args.input)))
-            return 0
-    except GuardError as exc:
-        sys.stderr.write(f"review_guard: {exc}\n")
-        return 2
-    raise AssertionError("unreachable")
+        _dump(value)
+        return 0 if value.get("state", "PASS") == "PASS" or args.command != "decide" else (2 if value["state"] == "FAIL" else 3)
+    except (GuardError, OSError, json.JSONDecodeError) as exc:
+        _dump({"state": "INCONCLUSIVE", "error": str(exc)})
+        return 3
 
 
 if __name__ == "__main__":

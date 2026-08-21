@@ -5,219 +5,179 @@ description: Run an explicit fail-closed adversarial correctness review of a com
 
 # Adversarial Review
 
-Run a bounded correctness review with exactly one active read-only custom reviewer.
-Treat review integrity as a prerequisite, not an assumption.
+Run a bounded review with exactly one read-only custom reviewer. Evidence artifacts, not the main agent's assertions, determine the outcome.
 
-## Non-negotiable outcome rules
+## Outcome state machine
 
-Use exactly one final state:
+- `PASS`: the exact reviewer completed, deterministic validation passed, the final version was reviewed unchanged, and every blocking finding is either objectively rejected or reviewer-verified as fixed.
+- `FAIL`: deterministic validation failed or a CONFIRMED CRITICAL/HIGH/MEDIUM finding is OPEN or STILL_PRESENT after the permitted repair cycles.
+- `INCONCLUSIVE`: review integrity, scope, identity, lifecycle continuity, or final-version coverage cannot be proved.
 
-- `PASS`: the review completed with provable integrity and no blocking finding remains.
-- `FAIL`: a CONFIRMED CRITICAL, HIGH, or MEDIUM defect remains after the permitted fixes, or deterministic validation proves the change is broken.
-- `INCONCLUSIVE`: review quality or final-version coverage cannot be proved.
-
-Never turn an execution failure, missing evidence, invalid response, or incomplete scope into PASS.
-Never substitute a generic reviewer for `adversarial_reviewer`.
-
-PASS requires all of the following:
-
-- the exact custom agent `adversarial_reviewer` was verified from spawn metadata;
-- it successfully completed every required review turn;
-- every response passed the bundled protocol validator;
-- the full change manifest was captured successfully, including untracked files;
-- the final reviewed snapshot exactly matches the state used for the decision;
-- the reviewer did not change the worktree;
-- relevant deterministic validation passed;
-- no CONFIRMED CRITICAL, HIGH, or MEDIUM finding remains;
-- no UNCERTAIN CRITICAL or HIGH finding remains;
-- every required escalation full review completed.
+`UNCERTAIN` CRITICAL/HIGH always forbids PASS. Any crash, timeout, empty/malformed response, missing receipt, wrong reviewer, undelivered follow-up, unexpected worktree change, incomplete verification, or exhausted required full-review budget produces INCONCLUSIVE. Never use a generic reviewer fallback.
 
 ## Hard budget
 
-- Initial full review: exactly 1.
-- Escalation full review after a substantial fix: at most 1.
-- Incremental re-reviews: at most 2 total.
-- Active reviewer agents: exactly 1 at a time.
-- Incremental turns: reuse the same verified reviewer thread.
-- LOW-only findings never trigger a repair loop.
+- Initial FULL review: exactly 1.
+- Escalation FULL re-review: at most 1.
+- INCREMENTAL re-reviews: at most 2.
+- Active reviewer agents: exactly 1; every follow-up uses the same proven thread.
+- LOW-only findings do not trigger repairs.
 
-If a required review would exceed the budget, return INCONCLUSIVE.
+## Evidence guard
 
-## Required guard
+Use `scripts/review_guard.py` for every manifest, receipt, validation, escalation, and decision. Store exact JSON artifacts in a private temporary directory outside the repository. Never edit receipts or reviewer results. If the guard, Git, Python, or a required capability is unavailable, stop with INCONCLUSIVE.
 
-Use `scripts/review_guard.py` from this skill directory for manifest capture, snapshot comparison, result validation, escalation assessment, and the final decision.
+Receipts are deterministic links to original artifacts, not replacements for them. Runtime metadata must come from the Codex orchestration surface. Never manually reconstruct metadata to make a preflight or turn pass.
 
-If Python 3, Git, the script, or any required guard command is unavailable or fails, return INCONCLUSIVE. Do not replace it with an improvised partial check.
+## 1. Deterministic validation
 
-Create a private temporary review directory outside the repository. Keep manifests, exact reviewer responses, and decision inputs there. Do not add review artifacts to the project.
+Run the cheapest relevant repository checks first. Record every command as:
 
-## 1. Run cheap validation first
+```json
+{"command":"...","exit_code":0,"output_sha256":"...","scope":"...","outcome":"PASSED|FAILED|INCONCLUSIVE"}
+```
 
-Run the cheapest relevant deterministic checks already present in the repository: focused tests, type checks, compilation, linting, or static checks.
+Create `validation.json` containing a non-empty `commands` array, then seal it:
 
-Fix obvious deterministic failures before spawning the reviewer. Record each command and result. Distinguish:
+```text
+review_guard.py validation-receipt --validation validation.json > validation-receipt.json
+```
 
-- `PASSED`: relevant checks completed successfully;
-- `FAILED`: checks prove a blocking implementation defect remains;
-- `INCONCLUSIVE`: checks could not execute or their result is unreliable.
+Fix obvious failures before review when within task scope. An unreliable or unexecutable required check is INCONCLUSIVE.
 
-## 2. Build and freeze the complete scope
+## 2. Capability preflight
 
-Choose the review target in this order:
+Before the expensive review, ask the runtime to prove all of these in exported metadata:
 
-1. target explicitly named by the user;
-2. implementation completed in the current task;
-3. current staged, unstaged, and untracked changes;
-4. branch diff against a reliably determined base.
+- configured and selected agent name is exactly `adversarial_reviewer`;
+- `.codex/agents/adversarial-reviewer.toml` loaded;
+- required model `gpt-5.6-terra` is available and selected;
+- custom routing selected the configured agent;
+- spawn completed and identity metadata is available;
+- same-thread follow-ups are supported;
+- stable spawn and thread IDs are present.
 
-Capture the target with the guard. Pass `--base <ref>` for a branch comparison and `--include <path>` for each explicit target file not already in the diff.
+Seal the unmodified runtime metadata:
 
-The captured manifest must contain:
+```text
+review_guard.py preflight-receipt --metadata preflight-metadata.json > preflight-receipt.json
+```
 
-- HEAD SHA;
-- base ref and merge-base SHA when applicable;
-- branch, staged, unstaged, renamed, added, deleted, and untracked entries;
-- SHA-256 for every current scope file and available baseline content;
-- Git status hash;
-- canonical diff hash and size;
-- a canonical manifest hash.
+If the runtime cannot expose this evidence, return INCONCLUSIVE before review. A prompt, task label, or self-reported identity is not proof.
 
-Treat `scope_complete != true`, an empty unintended scope, an unreadable path, an unsupported status, an unresolved base, or any capture error as INCONCLUSIVE.
+## 3. Freeze the complete scope
 
-Every untracked file is a first-class review input. Give the reviewer its path, size, hash, and an explicit instruction to inspect the entire file because no ordinary Git diff contains it.
+Choose the target in this order: explicit user scope, implementation from the current task, all current changes, then a reliable branch comparison. Capture with:
 
-Record a compact review brief containing the original requirement, acceptance criteria, manifest path and hash, base/target, all scope paths and statuses, untracked full-file inputs, and validation already run.
+```text
+review_guard.py capture [--base REF] [--include PATH ...] > manifest.json
+```
 
-Do not silently omit generated-looking, binary, large, renamed, or deleted files. If a behaviorally relevant file cannot be reviewed reliably, return INCONCLUSIVE.
+The standard workflow must never pass `--allow-empty`. Empty scope, unresolved merge conflicts, unmerged index stages, `git diff --check` failure, unsupported status, unreadable content, or unresolved base is INCONCLUSIVE.
 
-## 3. Spawn with fail-closed identity verification
+The manifest includes HEAD/merge-base, ADDED/MODIFIED/DELETED/RENAMED, staged/unstaged/untracked layers, full untracked content, per-file hashes, diff hash/size, semantic fingerprints, and its own canonical hash. Give the reviewer every scope path and the entire content of every untracked file.
 
-Immediately before spawn, capture `before-review.json` with the same guard arguments as the frozen target.
-Compare it to the original frozen manifest. If they differ, rebuild the brief from the new manifest before spawn; never review a stale brief.
+Immediately before each reviewer turn, capture the same scope again. If it differs, rebuild the review target; never send a stale manifest.
 
-Spawn exactly one custom agent by the configured name `adversarial_reviewer`. Do not request `default`, `worker`, `explorer`, or another generic role.
+## 4. Run and validate a reviewer turn
 
-Before trusting any output, verify from the spawn result or agent-thread metadata that the selected custom agent name is exactly `adversarial_reviewer`. The TOML `name` field is authoritative; the task label or a prompt claiming the name is not proof.
+Spawn only `adversarial_reviewer`. Export the exact completed-turn metadata and seal it:
 
-If the surface does not expose the selected custom-agent identity, or if spawn selects a different agent, return INCONCLUSIVE. Do not retry with a generic fallback.
+```text
+review_guard.py turn-receipt --metadata turn.json --preflight preflight-receipt.json > turn-receipt.json
+```
 
-Give the reviewer:
+The first turn is `FULL`, sequence 1, parent null. Later turns must be delivered to the same thread, have contiguous sequence numbers, and name the preceding review as parent. A crash, timeout, cancellation, missing result, or wrong thread is INCONCLUSIVE.
 
-- a unique review ID;
-- review kind `FULL`;
-- the compact brief;
-- the exact manifest hash;
-- the required JSON response protocol from its developer instructions.
+Capture the worktree immediately after the turn and compare it with the before snapshot:
 
-Wait for the reviewer to finish before changing any project file. A crash, timeout, cancellation, shutdown, missing result, undelivered task, or inability to prove successful completion means INCONCLUSIVE.
+```text
+review_guard.py compare --before before.json --after after.json > snapshot-receipt.json
+```
 
-## 4. Verify reviewer execution and response
+Any change, including outside the review scope, invalidates the review. Save the exact reviewer JSON and create its receipt:
 
-Immediately after completion and before any edit or validation command:
+```text
+review_guard.py validate-result \
+  --result review.json --manifest manifest.json \
+  --preflight preflight-receipt.json --turn turn-receipt.json \
+  --snapshot snapshot-receipt.json > result-receipt.json
+```
 
-1. capture `after-review.json` with the same arguments;
-2. compare it to `before-review.json` with `review_guard.py compare`;
-3. save the exact reviewer response without repair or reformatting;
-4. validate it with `review_guard.py validate-result`.
+Protocol v2 requires a completed envelope, exact manifest, every reviewed path, `findings`, and `finding_verifications`. Empty output is invalid. `findings: []` is valid only as part of a complete result and never closes an earlier finding.
 
-Any snapshot difference means the reviewer turn is invalid and the final state is INCONCLUSIVE. This includes changes outside the review scope.
+## 5. Preserve every finding lifecycle
 
-Any empty, truncated, malformed, non-JSON, wrong-version, wrong-reviewer, wrong-review-ID, wrong-kind, non-completed, wrong-manifest, or incomplete-path response is invalid and produces INCONCLUSIVE. Zero findings is valid only as an explicit, successfully validated `findings: []` response.
+The guard extracts immutable origin data directly from validated original results:
 
-## 5. Verify and classify every finding
+- `finding_id`
+- `origin_review_id`
+- `origin_result_sha256`
+- `origin_manifest_sha256`
+- `original_severity`
+- `finding_content_sha256`
 
-Classify every reviewer finding as:
+The main agent supplies only lifecycle state and evidence:
 
-- `CONFIRMED`
-- `REJECTED`
-- `UNCERTAIN`
+- classification: `CONFIRMED | REJECTED | UNCERTAIN`
+- resolution: `OPEN | FIXED | NOT_APPLICABLE`
+- `classification_evidence`
+- fix and verification links when FIXED.
 
-Confirm only with a reachable trigger/state, execution path, and observable wrong result or a clearly violated repository contract.
+Allowed pairs are CONFIRMED+OPEN, CONFIRMED+FIXED, REJECTED+NOT_APPLICABLE, and UNCERTAIN+OPEN. Every validated finding must occur exactly once in `classifications.json`. Missing, invented, duplicated, renamed, or severity-mutated findings make the result INCONCLUSIVE.
 
-For CRITICAL or HIGH, never use `REJECTED` based only on the main agent's interpretation. Attach objective rejection evidence of at least one accepted type:
+For REJECTED CRITICAL/HIGH, evidence type must be one of: executable reproduction, passing regression test disproving the trigger, explicit acceptance criterion, documented contract, type invariant, validation logic proving the trigger unreachable, or concrete repository evidence. Executable/test evidence must link the passing validation receipt. Contract/invariant/repository evidence must link a reviewed manifest, path, and matching content hash. “Seems intentional” or an unlinked reference is not evidence.
 
-- executable reproduction;
-- passing regression test that exercises and disproves the exact trigger;
-- explicit acceptance criterion;
-- documented contract;
-- type invariant;
-- validation logic that makes the trigger unreachable;
-- concrete repository evidence.
+## 6. Fix, escalate, and explicitly verify
 
-Record the evidence type, exact command or repository reference, and details. “Looks intentional”, “probably safe”, author confidence, or a test that does not exercise the trigger is insufficient. Without valid evidence, classify the CRITICAL/HIGH finding as UNCERTAIN.
+For each CONFIRMED blocking finding, fix the root cause, add focused regression validation, and capture the fix manifest. Assess the transition:
 
-Do not modify correct code merely to satisfy the reviewer. Do not spend the repair budget on LOW-only or style-only findings.
+```text
+review_guard.py assess-fix --before origin-manifest.json --after fix-manifest.json \
+  [--semantic public-api|schema|persistence|concurrency|core-invariant|architecture|core-algorithm] \
+  > escalation-receipt.json
+```
 
-## 6. Fix blocking findings and assess review escalation
+Manual semantic flags are additive. The guard also escalates automatically for new/unreviewed files, HEAD changes, major diff growth, exported/public symbols, routes, schemas/migrations, persistence/models, concurrency primitives, shared state, public types/interfaces, and serialization formats.
 
-For CONFIRMED blocking findings:
+If escalation says FULL, an incremental turn cannot close the finding. Run a new FULL review on the entire fix manifest or return INCONCLUSIVE if the budget is exhausted.
 
-- fix the root cause with the smallest defensible change;
-- add a focused regression test when practical;
-- rerun relevant deterministic validation;
-- capture a new current manifest with the same scope arguments.
+Every re-review request must list each earlier CONFIRMED finding ID and its origin result hash. The same reviewer must return one `finding_verifications` entry per requested finding:
 
-Run `review_guard.py assess-fix` against the last reviewed manifest and the new manifest. Add a `--semantic` flag for every applicable semantic change:
+- `FIXED`: original trigger is gone on the fix manifest and regression test was verified;
+- `STILL_PRESENT`: finding remains blocking;
+- `UNRESOLVED`: CRITICAL/HIGH is INCONCLUSIVE.
 
-- `public-api`
-- `schema`
-- `persistence`
-- `concurrency`
-- `core-invariant`
-- `architecture`
-- `core-algorithm`
+A missing entry is INCONCLUSIVE. To record CONFIRMED+FIXED, include `fixed_in_manifest_sha256`, `verified_by_review_id`, `verified_by_result_sha256`, and `regression_validation.validation_receipt_sha256`. The verification result must be later, validated, target that exact fix manifest, and explicitly say FIXED.
 
-The guard automatically escalates for new files, previously unreviewed paths, a changed HEAD, or significant diff growth. Semantic flags cover changes that Git shape alone cannot detect.
+## 7. Prove and decide the final version
 
-If escalation is required, an incremental review is insufficient. Route a new `FULL` turn over the entire new frozen manifest to the same verified custom reviewer thread and count it against the escalation-full-review budget. If the thread cannot receive and complete that full turn, or the budget is exhausted, return INCONCLUSIVE.
+Capture the final manifest, compare it unchanged immediately before decision, and seal it:
 
-If escalation is not required, send an `INCREMENTAL` follow-up to the same verified reviewer thread containing only the fix patch, fixed finding IDs, focused test results, the new manifest hash, and small directly related context.
+```text
+review_guard.py final-manifest-receipt \
+  --manifest final-manifest.json --snapshot final-snapshot-receipt.json \
+  > final-manifest-receipt.json
+```
 
-For every follow-up:
+The final manifest must equal the manifest in the last validated reviewer result. Then pass all original and receipt artifacts directly to the guard:
 
-- verify delivery to the exact existing thread;
-- capture and compare worktree snapshots around the turn;
-- require successful completion;
-- validate the exact response against its review ID, kind, and manifest;
-- reclassify every returned finding using the same evidence rules.
+```text
+review_guard.py decide \
+  --result initial-review.json [--result recheck.json ...] \
+  --manifest initial-manifest.json [--manifest fix-manifest.json ...] \
+  --result-receipt initial-result-receipt.json [--result-receipt recheck-receipt.json ...] \
+  --preflight-receipt preflight-receipt.json \
+  --turn-receipt initial-turn-receipt.json [--turn-receipt recheck-turn-receipt.json ...] \
+  --snapshot-receipt initial-snapshot.json [--snapshot-receipt recheck-snapshot.json ...] \
+  --classifications classifications.json \
+  --validation-receipt validation-receipt.json \
+  --final-manifest final-manifest.json --final-manifest-receipt final-manifest-receipt.json \
+  [--escalation-receipt escalation-receipt.json ...]
+```
 
-If delivery, completion, snapshot, or validation cannot be proved, return INCONCLUSIVE.
-
-## 7. Prove the final version was reviewed
-
-After all fixes and deterministic validation, capture a final manifest with the original scope arguments.
-
-The final manifest hash must equal the manifest hash in the last successfully validated reviewer response. If it differs, the final code was not reviewed. Perform the required incremental or full review if budget permits; otherwise return INCONCLUSIVE.
-
-Capture once more immediately before announcing PASS and compare again. Any unexpected scope, HEAD, status, diff, or content-hash change requires re-review or INCONCLUSIVE.
-
-## 8. Compute the final state
-
-Build the guard decision input with:
-
-- all eight integrity booleans required by `review_guard.py decide`;
-- validation state;
-- escalation requirement and completion;
-- every finding's severity and classification;
-- objective rejection evidence for every REJECTED CRITICAL/HIGH finding.
-
-Run `review_guard.py decide`. Report exactly the state emitted by the guard. Never override it with prose reasoning.
+Do not supply or synthesize integrity booleans. Report exactly the guard state.
 
 ## Final response
 
-Keep it concise:
-
-`Adversarial review: PASS | FAIL | INCONCLUSIVE`
-
-- Full reviews: N/2
-- Incremental re-reviews: N/2
-- Confirmed: Critical N / High N / Medium N
-- Fixed: N
-- Rejected false positives: N
-- Uncertain: Critical N / High N / Medium N
-- Scope manifest: `<final manifest hash>`
-- Validation: `<short list>`
-- Remaining blocking defects: `none | <short list>`
-- Inconclusive reasons: `none | <short list>`
-
-On PASS, say only that no confirmed blocking defects or unresolved CRITICAL/HIGH uncertainties remain in the proven reviewed scope. Never claim the implementation is perfect or bug-free.
+Start with `Adversarial review: PASS | FAIL | INCONCLUSIVE`, then give review counts, confirmed/fixed/rejected/uncertain counts, final manifest hash, validation summary, remaining blockers, and inconclusive reasons. On PASS say only that no confirmed blocking defect or unresolved CRITICAL/HIGH uncertainty remains in the proven reviewed scope; never claim perfection.
