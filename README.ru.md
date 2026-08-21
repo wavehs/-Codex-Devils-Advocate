@@ -94,6 +94,8 @@ DIFF-FIRST ВЫБОР КОНТЕКСТА
 | **Diff-first** | Сначала анализируются реальные изменения, а не весь репозиторий |
 | **Evidence-first** | Для finding нужен конкретный trigger, execution path и неправильный результат |
 | **Объективная проверка** | Для REJECTED CRITICAL/HIGH нужно исполняемое или repository evidence |
+| **Неизменяемый lifecycle finding-а** | Каждый finding связан hash-цепочкой от первого review через classification и fix до reviewer verification |
+| **Integrity через receipts** | Preflight, reviewer turns, snapshots, validation и final manifest вычисляются из evidence artifacts, а не свободных booleans |
 | **Fail-closed результат** | Сбой reviewer-а, неполный scope или high-risk uncertainty дают INCONCLUSIVE |
 | **Ограниченный re-review** | Один начальный full review, до одного escalation full review и максимум два incremental recheck |
 | **Глобальная установка** | Установили один раз — используете во всех проектах Codex |
@@ -184,7 +186,7 @@ Devil's Advocate вместо этого переиспользует уже п�
 3. staged, unstaged и untracked changes;
 4. branch diff, если его можно определить надёжно и дёшево.
 
-Target технически фиксируется через HEAD и merge-base SHA, статусы файлов, content hashes, Git-status hash и canonical diff hash. Untracked-файлы перечисляются явно и проверяются целиком. Worktree снимается до и после каждого reviewer turn.
+Target технически фиксируется через HEAD и merge-base SHA, статусы файлов, content hashes, Git-status hash и canonical diff hash. Пустой scope и unresolved merge conflicts запрещены. Untracked-файлы перечисляются явно и проверяются целиком. Worktree снимается до и после каждого reviewer turn.
 
 Это одновременно предотвращает scope drift, пропуск новых файлов и уход reviewer-а в несвязанный legacy code.
 
@@ -230,7 +232,16 @@ REJECTED
 UNCERTAIN
 ```
 
-Обычно только `CONFIRMED` должен приводить к изменению кода. CRITICAL или HIGH finding разрешено отклонить только с объективным доказательством: reproduction, точным regression test, документированным contract, type invariant, validation logic или конкретным repository reference. Нерешённый UNCERTAIN CRITICAL/HIGH запрещает PASS.
+Classification отделена от resolution:
+
+```text
+CONFIRMED + OPEN  → blocking
+CONFIRMED + FIXED → закрыт только validated re-review
+REJECTED + NOT_APPLICABLE
+UNCERTAIN + OPEN
+```
+
+Guard читает findings напрямую из оригинальных validated reviewer results и сохраняет их ID, severity, origin review/manifest и content hashes. Основной agent не может удалить или переписать finding в final decision. CRITICAL или HIGH finding разрешено отклонить только с объективным доказательством, hash-linked к passing validation receipt или проверенному repository content. Нерешённый UNCERTAIN CRITICAL/HIGH запрещает PASS.
 
 Это важно, потому что AI reviewer тоже может уверенно ошибаться.
 
@@ -249,7 +260,7 @@ UNCERTAIN
 ```text
 целостность review доказана
 + hash финального scope совпадает с проверенной версией
-+ нет подтверждённых blocking correctness defects
++ каждый подтверждённый blocking finding имеет reviewer-verified FIXED
 + нет нерешённых UNCERTAIN CRITICAL/HIGH findings
 ```
 
@@ -427,7 +438,7 @@ Only the transferred amount should leave the source stack.
 
 Основной Codex проверяет путь, подтверждает баг, исправляет его и добавляет regression test.
 
-Тот же reviewer получает только новый patch и проверяет:
+Тот же reviewer получает новый patch и ID всех findings, которые нужно закрыть. Для каждого он обязан явно вернуть `FIXED`, `STILL_PRESENT` или `UNRESOLVED` и проверяет:
 
 - действительно ли устранён исходный failure path;
 - не добавил ли fix новую регрессию рядом;
@@ -522,7 +533,7 @@ tests/
 
 ### `review_guard.py`
 
-Детерминированно строит полный change manifest, проверяет immutable snapshots и JSON reviewer-а, эскалирует большие fixes и вычисляет PASS, FAIL или INCONCLUSIVE.
+Детерминированно строит полный change manifest, создаёт custom-agent/turn/snapshot/validation receipts, сохраняет lifecycle findings, автоматически обнаруживает semantic escalation и вычисляет PASS, FAIL или INCONCLUSIVE из оригинальных reviewer artifacts.
 
 ### `adversarial-reviewer.toml`
 
