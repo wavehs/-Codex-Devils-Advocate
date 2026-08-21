@@ -58,14 +58,20 @@ CHEAP TESTS / BUILD / TYPECHECK
    ↓
 FREEZE REVIEW SCOPE
    ↓
+HASH MANIFEST + SNAPSHOT
+   ↓
 DIFF-FIRST CONTEXT SELECTION
    ↓
 ONE READ-ONLY ADVERSARIAL REVIEWER
    ↓
 MAIN CODEX VERIFIES FINDINGS
    ↓
+REVIEW INTEGRITY PROVEN?
+   ├── NO  → INCONCLUSIVE
+   └── YES
+        ↓
 CONFIRMED BLOCKING DEFECTS?
-   ├── NO  → PASS
+   ├── NO  → PASS / INCONCLUSIVE IF HIGH-RISK UNCERTAINTY REMAINS
    └── YES
         ↓
        FIX
@@ -91,11 +97,12 @@ No reviewer swarm. No endless recursive review loop. No full repository reread a
 | Feature | What it means |
 |---|---|
 | **1 reviewer only** | Avoids overlapping subagents and duplicated findings |
-| **Read-only reviewer** | The critic cannot mutate or quietly “fix” the code it is judging |
+| **Verified read-only reviewer** | Sandbox policy plus before/after worktree snapshots detect reviewer mutations |
 | **Diff-first** | Starts from the actual change instead of ingesting the whole repository |
 | **Evidence-first** | Findings need a concrete trigger, execution path, and incorrect result |
-| **Main-agent verification** | Reviewer findings are not blindly trusted |
-| **Bounded re-review** | One full review + at most two incremental rechecks |
+| **Objective verification** | CRITICAL/HIGH rejections require executable or repository evidence |
+| **Fail-closed result** | Reviewer failures, incomplete scope, or high-risk uncertainty produce INCONCLUSIVE |
+| **Bounded re-review** | One initial full review, up to one escalation full review, and at most two incremental rechecks |
 | **Global installation** | Install once and use in every Codex project |
 | **Explicit-only invocation** | It does not consume review budget unless you ask for it |
 
@@ -137,7 +144,8 @@ If that chain cannot be established, the issue should not be treated as a confir
 The hard default budget is:
 
 ```text
-Full adversarial reviews: 1
+Initial full adversarial reviews: 1
+Escalation full reviews after substantial fixes: up to 1
 Incremental re-reviews: up to 2
 Concurrent reviewer subagents: 1
 ```
@@ -179,10 +187,12 @@ The target is selected from, in order:
 
 1. scope explicitly named by the user
 2. implementation completed in the current task
-3. current staged/unstaged diff
+3. current staged, unstaged, and untracked changes
 4. branch comparison when it can be determined reliably
 
-This prevents the reviewer from wandering into unrelated legacy code and spending tokens finding bugs that have nothing to do with the change you just made.
+The target is frozen with HEAD and merge-base SHAs, file statuses, content hashes, a Git-status hash, and a canonical diff hash. Untracked files are listed explicitly and reviewed in full. The worktree is captured before and after every reviewer turn.
+
+This prevents both scope drift and accidental omission while keeping the reviewer out of unrelated legacy code.
 
 ---
 
@@ -226,7 +236,7 @@ REJECTED
 UNCERTAIN
 ```
 
-Only confirmed defects should normally lead to code changes.
+Only confirmed defects should normally lead to code changes. A CRITICAL or HIGH finding can be rejected only with objective evidence such as a reproduction, an exact regression test, a documented contract, a type invariant, validation logic, or a concrete repository reference. An unresolved UNCERTAIN CRITICAL/HIGH finding forbids PASS.
 
 This matters because an AI critic can be confidently wrong too.
 
@@ -240,10 +250,13 @@ The goal is **not**:
 zero criticism
 ```
 
-The goal is:
+PASS requires:
 
 ```text
-zero confirmed blocking correctness defects
+review integrity proven
++ final scope hash matches the reviewed version
++ zero confirmed blocking correctness defects
++ zero unresolved UNCERTAIN CRITICAL/HIGH findings
 ```
 
 Blocking severity levels are:
@@ -257,6 +270,8 @@ The workflow does not keep consuming tokens because of style preferences, theore
 ---
 
 # Installation
+
+Requirements: Git and Python 3. The bundled guard deliberately fails closed when it cannot capture or verify review state.
 
 ## Global install — recommended
 
@@ -432,8 +447,11 @@ Adversarial review: PASS
 - Confirmed: Critical 0 / High 1 / Medium 0
 - Fixed: 1
 - Rejected false positives: 1
+- Uncertain: Critical 0 / High 0 / Medium 0
+- Scope manifest: <sha256>
 - Validation: targeted tests, build
 - Remaining blocking defects: none
+- Inconclusive reasons: none
 ```
 
 ---
@@ -473,7 +491,7 @@ Same reviewer thread
  └── targeted incremental recheck
         │
         ▼
-      PASS / FAIL
+ PASS / FAIL / INCONCLUSIVE
 ```
 
 ---
@@ -485,6 +503,8 @@ Same reviewer thread
 └── skills/
     └── adversarial-review/
         ├── SKILL.md
+        ├── scripts/
+        │   └── review_guard.py
         └── agents/
             └── openai.yaml
 
@@ -496,11 +516,17 @@ install.ps1
 install.sh
 uninstall.ps1
 uninstall.sh
+tests/
+└── test_review_guard.py
 ```
 
 ### `SKILL.md`
 
 Controls the review workflow, budget, scope selection, verification loop, fix loop, and stop condition.
+
+### `review_guard.py`
+
+Deterministically captures complete change manifests, verifies immutable snapshots and reviewer JSON, escalates large fixes, and computes PASS, FAIL, or INCONCLUSIVE.
 
 ### `adversarial-reviewer.toml`
 

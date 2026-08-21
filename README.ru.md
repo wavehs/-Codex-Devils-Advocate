@@ -51,14 +51,20 @@ Skill запускает ограниченный adversarial loop:
    ↓
 ФИКСАЦИЯ SCOPE
    ↓
+HASH MANIFEST + SNAPSHOT
+   ↓
 DIFF-FIRST ВЫБОР КОНТЕКСТА
    ↓
 ОДИН READ-ONLY ADVERSARIAL REVIEWER
    ↓
 ОСНОВНОЙ CODEX ПРОВЕРЯЕТ FINDINGS
    ↓
+ЦЕЛОСТНОСТЬ REVIEW ДОКАЗАНА?
+   ├── НЕТ → INCONCLUSIVE
+   └── ДА
+        ↓
 ЕСТЬ ПОДТВЕРЖДЁННЫЕ BLOCKING-БАГИ?
-   ├── НЕТ → PASS
+   ├── НЕТ → PASS / INCONCLUSIVE ПРИ HIGH-RISK НЕОПРЕДЕЛЁННОСТИ
    └── ДА
         ↓
      ИСПРАВЛЕНИЕ
@@ -84,11 +90,12 @@ DIFF-FIRST ВЫБОР КОНТЕКСТА
 | Возможность | Что это даёт |
 |---|---|
 | **Только 1 reviewer** | Нет нескольких агентов, читающих один и тот же код и дублирующих находки |
-| **Read-only reviewer** | Reviewer не может менять код, который сам же оценивает |
+| **Проверяемый read-only reviewer** | Sandbox и снимки worktree до/после обнаруживают изменения reviewer-а |
 | **Diff-first** | Сначала анализируются реальные изменения, а не весь репозиторий |
 | **Evidence-first** | Для finding нужен конкретный trigger, execution path и неправильный результат |
-| **Проверка основным агентом** | Findings reviewer-а не принимаются на веру |
-| **Ограниченный re-review** | Один полный review + максимум два incremental recheck |
+| **Объективная проверка** | Для REJECTED CRITICAL/HIGH нужно исполняемое или repository evidence |
+| **Fail-closed результат** | Сбой reviewer-а, неполный scope или high-risk uncertainty дают INCONCLUSIVE |
+| **Ограниченный re-review** | Один начальный full review, до одного escalation full review и максимум два incremental recheck |
 | **Глобальная установка** | Установили один раз — используете во всех проектах Codex |
 | **Только ручной вызов** | Skill не расходует лимит, пока вы сами его не вызовете |
 
@@ -131,7 +138,8 @@ trigger / state
 Жёсткий бюджет по умолчанию:
 
 ```text
-Полных adversarial review: 1
+Начальных full adversarial review: 1
+Escalation full review после существенного fix: максимум 1
 Incremental re-review: максимум 2
 Одновременно reviewer subagents: 1
 ```
@@ -173,10 +181,12 @@ Devil's Advocate вместо этого переиспользует уже п�
 
 1. scope, явно указанный пользователем;
 2. реализация, завершённая в текущей задаче;
-3. staged + unstaged diff;
+3. staged, unstaged и untracked changes;
 4. branch diff, если его можно определить надёжно и дёшево.
 
-Это не даёт reviewer-у уходить в несвязанный legacy code и тратить токены на баги, не относящиеся к текущему изменению.
+Target технически фиксируется через HEAD и merge-base SHA, статусы файлов, content hashes, Git-status hash и canonical diff hash. Untracked-файлы перечисляются явно и проверяются целиком. Worktree снимается до и после каждого reviewer turn.
+
+Это одновременно предотвращает scope drift, пропуск новых файлов и уход reviewer-а в несвязанный legacy code.
 
 ---
 
@@ -220,7 +230,7 @@ REJECTED
 UNCERTAIN
 ```
 
-Обычно только `CONFIRMED` должен приводить к изменению кода.
+Обычно только `CONFIRMED` должен приводить к изменению кода. CRITICAL или HIGH finding разрешено отклонить только с объективным доказательством: reproduction, точным regression test, документированным contract, type invariant, validation logic или конкретным repository reference. Нерешённый UNCERTAIN CRITICAL/HIGH запрещает PASS.
 
 Это важно, потому что AI reviewer тоже может уверенно ошибаться.
 
@@ -234,10 +244,13 @@ UNCERTAIN
 ноль замечаний
 ```
 
-Цель:
+Для PASS требуется:
 
 ```text
-ноль подтверждённых blocking correctness defects
+целостность review доказана
++ hash финального scope совпадает с проверенной версией
++ нет подтверждённых blocking correctness defects
++ нет нерешённых UNCERTAIN CRITICAL/HIGH findings
 ```
 
 Blocking severity:
@@ -252,6 +265,8 @@ Skill не продолжает расходовать токены из-за st
 
 <a id="installation"></a>
 # Установка
+
+Требования: Git и Python 3. Встроенный guard намеренно возвращает INCONCLUSIVE, если не может надёжно зафиксировать или проверить состояние review.
 
 ## Глобальная установка — рекомендуется
 
@@ -428,8 +443,11 @@ Adversarial review: PASS
 - Confirmed: Critical 0 / High 1 / Medium 0
 - Fixed: 1
 - Rejected false positives: 1
+- Uncertain: Critical 0 / High 0 / Medium 0
+- Scope manifest: <sha256>
 - Validation: targeted tests, build
 - Remaining blocking defects: none
+- Inconclusive reasons: none
 ```
 
 ---
@@ -469,7 +487,7 @@ Adversarial review: PASS
  └── targeted incremental recheck
         │
         ▼
-      PASS / FAIL
+ PASS / FAIL / INCONCLUSIVE
 ```
 
 ---
@@ -481,6 +499,8 @@ Adversarial review: PASS
 └── skills/
     └── adversarial-review/
         ├── SKILL.md
+        ├── scripts/
+        │   └── review_guard.py
         └── agents/
             └── openai.yaml
 
@@ -492,11 +512,17 @@ install.ps1
 install.sh
 uninstall.ps1
 uninstall.sh
+tests/
+└── test_review_guard.py
 ```
 
 ### `SKILL.md`
 
 Управляет workflow, бюджетом review, выбором scope, проверкой findings, циклом исправлений и условием остановки.
+
+### `review_guard.py`
+
+Детерминированно строит полный change manifest, проверяет immutable snapshots и JSON reviewer-а, эскалирует большие fixes и вычисляет PASS, FAIL или INCONCLUSIVE.
 
 ### `adversarial-reviewer.toml`
 
