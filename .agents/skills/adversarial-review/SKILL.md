@@ -1,159 +1,223 @@
 ---
 name: adversarial-review
-description: Explicit, token-efficient adversarial review of a completed code change. Use only when the user invokes $adversarial-review after implementation and wants concrete correctness defects found, verified, fixed, and incrementally rechecked.
+description: Run an explicit fail-closed adversarial correctness review of a completed code change. Use only when the user invokes $adversarial-review and wants defects independently found, objectively verified, fixed, and rechecked with a final PASS, FAIL, or INCONCLUSIVE result.
 ---
 
 # Adversarial Review
 
-Run a bounded adversarial correctness loop with exactly ONE read-only reviewer.
-Optimize for confirmed defects per token, not review breadth.
+Run a bounded correctness review with exactly one active read-only custom reviewer.
+Treat review integrity as a prerequisite, not an assumption.
+
+## Non-negotiable outcome rules
+
+Use exactly one final state:
+
+- `PASS`: the review completed with provable integrity and no blocking finding remains.
+- `FAIL`: a CONFIRMED CRITICAL, HIGH, or MEDIUM defect remains after the permitted fixes, or deterministic validation proves the change is broken.
+- `INCONCLUSIVE`: review quality or final-version coverage cannot be proved.
+
+Never turn an execution failure, missing evidence, invalid response, or incomplete scope into PASS.
+Never substitute a generic reviewer for `adversarial_reviewer`.
+
+PASS requires all of the following:
+
+- the exact custom agent `adversarial_reviewer` was verified from spawn metadata;
+- it successfully completed every required review turn;
+- every response passed the bundled protocol validator;
+- the full change manifest was captured successfully, including untracked files;
+- the final reviewed snapshot exactly matches the state used for the decision;
+- the reviewer did not change the worktree;
+- relevant deterministic validation passed;
+- no CONFIRMED CRITICAL, HIGH, or MEDIUM finding remains;
+- no UNCERTAIN CRITICAL or HIGH finding remains;
+- every required escalation full review completed.
 
 ## Hard budget
 
-- Full adversarial review: exactly 1.
-- Incremental re-reviews: at most 2.
-- Reviewer agents alive at once: exactly 1.
-- Reuse the SAME reviewer thread for incremental re-reviews.
-- Never spawn a fresh reviewer automatically.
-- Do not loop on LOW, style-only, theoretical, or unproven concerns.
+- Initial full review: exactly 1.
+- Escalation full review after a substantial fix: at most 1.
+- Incremental re-reviews: at most 2 total.
+- Active reviewer agents: exactly 1 at a time.
+- Incremental turns: reuse the same verified reviewer thread.
+- LOW-only findings never trigger a repair loop.
 
-Blocking findings are confirmed CRITICAL, HIGH, or MEDIUM correctness defects.
+If a required review would exceed the budget, return INCONCLUSIVE.
 
-## 1. Cheap validation first
+## Required guard
 
-Before using reviewer tokens, run the cheapest relevant deterministic checks already available in the repository, such as targeted tests, type checks, compilation, or static checks.
+Use `scripts/review_guard.py` from this skill directory for manifest capture, snapshot comparison, result validation, escalation assessment, and the final decision.
 
-Prefer changed-area checks over a huge full-suite run unless repository instructions or the task require the full suite.
-Fix obvious deterministic failures before adversarial review.
+If Python 3, Git, the script, or any required guard command is unavailable or fails, return INCONCLUSIVE. Do not replace it with an improvised partial check.
 
-## 2. Freeze the review scope
+Create a private temporary review directory outside the repository. Keep manifests, exact reviewer responses, and decision inputs there. Do not add review artifacts to the project.
 
-At skill start, define one immutable review target.
+## 1. Run cheap validation first
 
-Prefer in this order:
+Run the cheapest relevant deterministic checks already present in the repository: focused tests, type checks, compilation, linting, or static checks.
+
+Fix obvious deterministic failures before spawning the reviewer. Record each command and result. Distinguish:
+
+- `PASSED`: relevant checks completed successfully;
+- `FAILED`: checks prove a blocking implementation defect remains;
+- `INCONCLUSIVE`: checks could not execute or their result is unreliable.
+
+## 2. Build and freeze the complete scope
+
+Choose the review target in this order:
+
 1. target explicitly named by the user;
 2. implementation completed in the current task;
-3. current staged + unstaged diff;
-4. branch diff against the repository's normal base only when it can be determined reliably and cheaply.
+3. current staged, unstaged, and untracked changes;
+4. branch diff against a reliably determined base.
 
-Record a compact review brief containing:
-- original requirement / acceptance criteria;
-- base and target when applicable;
-- changed-file list;
-- current diff summary;
-- relevant validation already run.
+Capture the target with the guard. Pass `--base <ref>` for a branch comparison and `--include <path>` for each explicit target file not already in the diff.
 
-Do not silently widen the review into unrelated pre-existing code.
+The captured manifest must contain:
 
-## 3. Context minimization
+- HEAD SHA;
+- base ref and merge-base SHA when applicable;
+- branch, staged, unstaged, renamed, added, deleted, and untracked entries;
+- SHA-256 for every current scope file and available baseline content;
+- Git status hash;
+- canonical diff hash and size;
+- a canonical manifest hash.
 
-Use a DIFF-FIRST strategy.
+Treat `scope_complete != true`, an empty unintended scope, an unreadable path, an unsupported status, an unresolved base, or any capture error as INCONCLUSIVE.
 
-Start from:
-- the actual diff;
-- changed symbols;
-- directly related tests.
+Every untracked file is a first-class review input. Give the reviewer its path, size, hash, and an explicit instruction to inspect the entire file because no ordinary Git diff contains it.
 
-Expand only when needed to prove or disprove a defect:
-- direct callers and callees;
-- interfaces/contracts/types;
-- state transitions and invariants;
-- persistence/API/schema boundaries;
-- code whose behavior can regress because of the change.
+Record a compact review brief containing the original requirement, acceptance criteria, manifest path and hash, base/target, all scope paths and statuses, untracked full-file inputs, and validation already run.
 
-Prefer targeted search and small file ranges over broad repository scans.
-Skip generated files, vendored code, large fixtures, lockfiles, and unrelated modules unless they are behaviorally relevant.
-Do not paste large repository contents into the subagent prompt; give the reviewer the compact brief and let it inspect targeted context itself.
+Do not silently omit generated-looking, binary, large, renamed, or deleted files. If a behaviorally relevant file cannot be reviewed reliably, return INCONCLUSIVE.
 
-## 4. Spawn the reviewer
+## 3. Spawn with fail-closed identity verification
 
-Spawn exactly ONE custom agent named `adversarial_reviewer`.
-Wait for it to finish before modifying code.
+Immediately before spawn, capture `before-review.json` with the same guard arguments as the frozen target.
+Compare it to the original frozen manifest. If they differ, rebuild the brief from the new manifest before spawn; never review a stale brief.
 
-Give it the frozen review brief and instruct it to:
-- independently reconstruct intended behavior;
-- attempt to falsify the implementation;
-- inspect the diff first and expand context only as necessary;
-- return only evidence-backed defects;
-- remain read-only.
+Spawn exactly one custom agent by the configured name `adversarial_reviewer`. Do not request `default`, `worker`, `explorer`, or another generic role.
 
-Do not defend the implementation or reveal your own confidence in specific areas.
+Before trusting any output, verify from the spawn result or agent-thread metadata that the selected custom agent name is exactly `adversarial_reviewer`. The TOML `name` field is authoritative; the task label or a prompt claiming the name is not proof.
 
-## 5. Verify every finding
+If the surface does not expose the selected custom-agent identity, or if spawn selects a different agent, return INCONCLUSIVE. Do not retry with a generic fallback.
 
-The main agent is the judge. The reviewer is not ground truth.
+Give the reviewer:
 
-For each finding classify it as:
-- CONFIRMED
-- REJECTED
-- UNCERTAIN
+- a unique review ID;
+- review kind `FULL`;
+- the compact brief;
+- the exact manifest hash;
+- the required JSON response protocol from its developer instructions.
 
-Confirm only when there is a plausible reachable path from trigger/state to observable incorrect behavior or a clearly violated repository contract.
+Wait for the reviewer to finish before changing any project file. A crash, timeout, cancellation, shutdown, missing result, undelivered task, or inability to prove successful completion means INCONCLUSIVE.
 
-Cheaply check callers, validation, types, tests, or framework behavior when that can settle a finding.
-Reject false positives.
-Do not modify correct code merely to satisfy the reviewer.
-Do not spend large extra exploration budgets trying to prove a low-confidence suspicion.
+## 4. Verify reviewer execution and response
 
-## 6. Fix confirmed blocking findings
+Immediately after completion and before any edit or validation command:
 
-If no confirmed blocking findings remain, stop and PASS.
+1. capture `after-review.json` with the same arguments;
+2. compare it to `before-review.json` with `review_guard.py compare`;
+3. save the exact reviewer response without repair or reformatting;
+4. validate it with `review_guard.py validate-result`.
 
-Otherwise:
-- fix root causes, not symptoms;
-- keep changes minimal and in scope;
-- add focused regression tests when practical;
-- run relevant deterministic validation.
+Any snapshot difference means the reviewer turn is invalid and the final state is INCONCLUSIVE. This includes changes outside the review scope.
 
-Do not ask the reviewer to re-review LOW-only findings.
+Any empty, truncated, malformed, non-JSON, wrong-version, wrong-reviewer, wrong-review-ID, wrong-kind, non-completed, wrong-manifest, or incomplete-path response is invalid and produces INCONCLUSIVE. Zero findings is valid only as an explicit, successfully validated `findings: []` response.
 
-## 7. Incremental re-review
+## 5. Verify and classify every finding
 
-If fixes were made, route a follow-up to the SAME `adversarial_reviewer` thread.
-Do not spawn another reviewer.
+Classify every reviewer finding as:
 
-Provide only:
-- the patch since the previous review;
-- which confirmed findings were fixed;
-- focused regression-test results;
-- any small new context required by the fixes.
+- `CONFIRMED`
+- `REJECTED`
+- `UNCERTAIN`
 
-Ask it to inspect only:
-1. whether the demonstrated failure paths are actually fixed;
-2. whether the fixes introduced regressions in directly related paths;
-3. whether the regression tests actually prove the intended behavior;
-4. any new blocking defect exposed by the changed fix itself.
+Confirm only with a reachable trigger/state, execution path, and observable wrong result or a clearly violated repository contract.
 
-It must not restart a full repository review.
+For CRITICAL or HIGH, never use `REJECTED` based only on the main agent's interpretation. Attach objective rejection evidence of at least one accepted type:
 
-Verify its findings again as in step 5.
-If blocking findings are confirmed, fix and validate, then perform one more incremental re-review if budget remains.
+- executable reproduction;
+- passing regression test that exercises and disproves the exact trigger;
+- explicit acceptance criterion;
+- documented contract;
+- type invariant;
+- validation logic that makes the trigger unreachable;
+- concrete repository evidence.
 
-## 8. Stop condition
+Record the evidence type, exact command or repository reference, and details. “Looks intentional”, “probably safe”, author confidence, or a test that does not exercise the trigger is insufficient. Without valid evidence, classify the CRITICAL/HIGH finding as UNCERTAIN.
 
-PASS when all are true:
-- relevant deterministic validation passes;
-- no CONFIRMED CRITICAL/HIGH/MEDIUM defect remains in the frozen scope.
+Do not modify correct code merely to satisfy the reviewer. Do not spend the repair budget on LOW-only or style-only findings.
 
-Do not require zero LOW findings or zero theoretical risk.
-Do not claim the code is bug-free.
+## 6. Fix blocking findings and assess review escalation
 
-If the two incremental re-reviews are exhausted and a blocking defect still remains, stop the adversarial loop, report FAIL, and state the remaining confirmed defect. Do not exceed the review budget automatically.
+For CONFIRMED blocking findings:
 
-A new full `$adversarial-review` is justified only if the fixes materially changed the architecture, core algorithm, or review scope.
+- fix the root cause with the smallest defensible change;
+- add a focused regression test when practical;
+- rerun relevant deterministic validation;
+- capture a new current manifest with the same scope arguments.
+
+Run `review_guard.py assess-fix` against the last reviewed manifest and the new manifest. Add a `--semantic` flag for every applicable semantic change:
+
+- `public-api`
+- `schema`
+- `persistence`
+- `concurrency`
+- `core-invariant`
+- `architecture`
+- `core-algorithm`
+
+The guard automatically escalates for new files, previously unreviewed paths, a changed HEAD, or significant diff growth. Semantic flags cover changes that Git shape alone cannot detect.
+
+If escalation is required, an incremental review is insufficient. Route a new `FULL` turn over the entire new frozen manifest to the same verified custom reviewer thread and count it against the escalation-full-review budget. If the thread cannot receive and complete that full turn, or the budget is exhausted, return INCONCLUSIVE.
+
+If escalation is not required, send an `INCREMENTAL` follow-up to the same verified reviewer thread containing only the fix patch, fixed finding IDs, focused test results, the new manifest hash, and small directly related context.
+
+For every follow-up:
+
+- verify delivery to the exact existing thread;
+- capture and compare worktree snapshots around the turn;
+- require successful completion;
+- validate the exact response against its review ID, kind, and manifest;
+- reclassify every returned finding using the same evidence rules.
+
+If delivery, completion, snapshot, or validation cannot be proved, return INCONCLUSIVE.
+
+## 7. Prove the final version was reviewed
+
+After all fixes and deterministic validation, capture a final manifest with the original scope arguments.
+
+The final manifest hash must equal the manifest hash in the last successfully validated reviewer response. If it differs, the final code was not reviewed. Perform the required incremental or full review if budget permits; otherwise return INCONCLUSIVE.
+
+Capture once more immediately before announcing PASS and compare again. Any unexpected scope, HEAD, status, diff, or content-hash change requires re-review or INCONCLUSIVE.
+
+## 8. Compute the final state
+
+Build the guard decision input with:
+
+- all eight integrity booleans required by `review_guard.py decide`;
+- validation state;
+- escalation requirement and completion;
+- every finding's severity and classification;
+- objective rejection evidence for every REJECTED CRITICAL/HIGH finding.
+
+Run `review_guard.py decide`. Report exactly the state emitted by the guard. Never override it with prose reasoning.
 
 ## Final response
 
 Keep it concise:
 
-`Adversarial review: PASS | FAIL`
+`Adversarial review: PASS | FAIL | INCONCLUSIVE`
 
-- Full reviews: 1
+- Full reviews: N/2
 - Incremental re-reviews: N/2
 - Confirmed: Critical N / High N / Medium N
 - Fixed: N
 - Rejected false positives: N
-- Validation: <short list>
-- Remaining blocking defects: none | <short list>
+- Uncertain: Critical N / High N / Medium N
+- Scope manifest: `<final manifest hash>`
+- Validation: `<short list>`
+- Remaining blocking defects: `none | <short list>`
+- Inconclusive reasons: `none | <short list>`
 
-On PASS, say only that no confirmed blocking defects remain in the reviewed scope; never say the implementation is perfect or bug-free.
+On PASS, say only that no confirmed blocking defects or unresolved CRITICAL/HIGH uncertainties remain in the proven reviewed scope. Never claim the implementation is perfect or bug-free.
