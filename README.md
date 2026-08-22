@@ -17,7 +17,7 @@
 <p align="center">
   <a href="#installation"><img src="https://img.shields.io/badge/INSTALL-dc2626?style=for-the-badge&logo=gnubash&logoColor=white" alt="Install" /></a>
   <a href="#usage"><img src="https://img.shields.io/badge/USAGE-991b1b?style=for-the-badge&logo=windowsterminal&logoColor=white" alt="Usage" /></a>
-  <a href="#the-idea"><img src="https://img.shields.io/badge/HOW%20IT%20WORKS-991b1b?style=for-the-badge&logo=gitbook&logoColor=white" alt="How it works" /></a>
+  <a href="#runtime-compatibility-modes"><img src="https://img.shields.io/badge/RUNTIME%20MODES-991b1b?style=for-the-badge" alt="Runtime modes" /></a>
   <a href="#token-efficiency-by-design"><img src="https://img.shields.io/badge/LOW%20TOKEN%20DESIGN-dc2626?style=for-the-badge&logo=lightning&logoColor=white" alt="Low token design" /></a>
 </p>
 
@@ -49,46 +49,92 @@ After Codex finishes a task, invoke:
 $adversarial-review
 ```
 
-The skill then runs a bounded adversarial loop:
+The skill now checks runtime compatibility **before** spending tokens on tests, a full manifest, or a reviewer:
 
 ```text
 IMPLEMENT
    ↓
+RUNTIME PREFLIGHT
+   ├── STRICT + identity/sandbox cannot be attested
+   │      ↓
+   │  INCONCLUSIVE — STOP EARLY
+   │
+   └── supported / BEST_EFFORT
+          ↓
 CHEAP TESTS / BUILD / TYPECHECK
    ↓
 FREEZE REVIEW SCOPE
    ↓
 HASH MANIFEST + SNAPSHOT
    ↓
-DIFF-FIRST CONTEXT SELECTION
-   ↓
-ONE READ-ONLY ADVERSARIAL REVIEWER
+ONE ADVERSARIAL REVIEWER
    ↓
 MAIN CODEX VERIFIES FINDINGS
    ↓
 REVIEW INTEGRITY PROVEN?
-   ├── NO  → INCONCLUSIVE
-   └── YES
-        ↓
-CONFIRMED BLOCKING DEFECTS?
-   ├── NO  → PASS / INCONCLUSIVE IF HIGH-RISK UNCERTAINTY REMAINS
-   └── YES
-        ↓
-       FIX
-        ↓
-   REGRESSION TESTS
-        ↓
- SAME REVIEWER THREAD
- TARGETED RECHECK
-        ↓
-   MAYBE FIX AGAIN
-        ↓
-   TARGETED RECHECK #2
-        ↓
-       STOP
+   ├── YES → PASS / FAIL
+   ├── ONLY RUNTIME ATTESTATION MISSING IN BEST_EFFORT → UNVERIFIED
+   └── OTHER INTEGRITY FAILURE → INCONCLUSIVE
 ```
 
 No reviewer swarm. No endless recursive review loop. No full repository reread after every fix.
+
+---
+
+## Runtime compatibility modes
+
+Some Codex runtimes can load a custom-agent TOML but do not expose enough trusted spawn/thread metadata to prove which custom agent actually ran or which effective sandbox policy the child received. `task_name`, a child self-report, or the local TOML file are not sufficient proof.
+
+Devil's Advocate handles that boundary explicitly instead of pretending the runtime is stronger than it is.
+
+### STRICT — default
+
+```text
+$adversarial-review
+```
+
+STRICT requires runtime evidence for both:
+
+```text
+selected custom agent = adversarial_reviewer
+effective sandbox     = read-only
+```
+
+If the current Codex surface cannot prove those facts, the skill stops **before** project tests, full-project scope enumeration, manifest hashing, or reviewer execution:
+
+```text
+Adversarial review: INCONCLUSIVE
+Runtime attestation unavailable.
+```
+
+That prevents a known-incompatible runtime from consuming the full review budget when a trusted PASS/FAIL is impossible anyway.
+
+### BEST_EFFORT — explicit opt-in
+
+Ask Codex to run:
+
+```text
+$adversarial-review in BEST_EFFORT mode
+```
+
+BEST_EFFORT keeps the deterministic parts of the workflow:
+
+- complete scope manifest
+- before/after worktree snapshots
+- exact reviewer JSON preservation
+- protocol validation
+- independent parent verification of findings
+- bounded review/re-review budget
+
+If exact custom-agent identity or effective sandbox cannot be attested, the result becomes:
+
+```text
+Adversarial review: UNVERIFIED
+```
+
+The findings can still be useful and independently checked, but `UNVERIFIED` is **never** presented as a certified PASS or FAIL.
+
+When exact custom-agent selection is unavailable, BEST_EFFORT may use one generic child with the bundled `references/best-effort-reviewer.md` contract. STRICT never does this.
 
 ---
 
@@ -96,14 +142,15 @@ No reviewer swarm. No endless recursive review loop. No full repository reread a
 
 | Feature | What it means |
 |---|---|
+| **Runtime preflight first** | Known-incompatible Codex runtimes stop before expensive tests/manifests/reviewer turns |
+| **STRICT by default** | PASS/FAIL require trusted runtime identity and effective read-only sandbox attestation |
+| **Optional BEST_EFFORT** | Useful review can continue as UNVERIFIED instead of discarding all findings |
 | **1 reviewer only** | Avoids overlapping subagents and duplicated findings |
-| **Verified read-only reviewer** | PASS requires runtime metadata proving the spawned reviewer is effectively read-only, plus unchanged before/after snapshots |
 | **Diff-first** | Starts from the actual change instead of ingesting the whole repository |
 | **Evidence-first** | Findings need a concrete trigger, execution path, and incorrect result |
 | **Objective verification** | CRITICAL/HIGH rejections require executable or repository evidence |
-| **Fail-closed result** | Reviewer failures, incomplete scope, or high-risk uncertainty produce INCONCLUSIVE |
+| **Fail-closed core integrity** | Malformed output, incomplete scope, worktree mutation, or unreviewed final code still produce INCONCLUSIVE |
 | **Bounded re-review** | One initial full review, up to one escalation full review, and at most two incremental rechecks |
-| **Global installation** | Install once and use in every Codex project |
 | **Explicit-only invocation** | It does not consume review budget unless you ask for it |
 
 ---
@@ -124,8 +171,6 @@ The reviewer attempts to falsify the implementation by searching for concrete fa
 - concurrency problems when relevant
 - security problems when relevant
 
-It is specifically told **not** to manufacture criticism just to look useful.
-
 A good finding should look like:
 
 ```text
@@ -139,9 +184,29 @@ If that chain cannot be established, the issue should not be treated as a confir
 
 ---
 
+## Protocol compatibility
+
+The reviewer is instructed to return `confidence` as an integer from `0` to `100`:
+
+```json
+"confidence": 99
+```
+
+Real Codex model output can sometimes use a fractional form instead:
+
+```json
+"confidence": 0.99
+```
+
+The guard accepts both forms without rewriting the original reviewer response. Integers must be in `0..100`; fractional floats must be finite and in `0.0..1.0`.
+
+This tolerance affects only the confidence field. It does **not** weaken identity, sandbox, manifest, reviewed-path, review-ID, status, or snapshot checks.
+
+---
+
 ## Token-efficiency by design
 
-The hard default budget is:
+The hard review budget after preflight is:
 
 ```text
 Initial full adversarial reviews: 1
@@ -150,38 +215,15 @@ Incremental re-reviews: up to 2
 Concurrent reviewer subagents: 1
 ```
 
-### What this avoids
+A failed STRICT runtime preflight uses zero reviewer turns.
 
-A naive adversarial workflow often becomes:
-
-```text
-Reviewer A reads repository
-→ fix
-Reviewer B reads repository again
-→ fix
-Reviewer C reads repository again
-→ final reviewer reads repository again
-```
-
-That may improve review diversity, but it is expensive.
-
-Devil's Advocate instead reuses the reviewer's existing mental model:
-
-```text
-full review
-→ fix
-→ inspect only the new patch + related paths
-→ fix if needed
-→ one last targeted check
-```
-
-This keeps the expensive repository-understanding step bounded.
+Devil's Advocate reuses the same reviewer thread after fixes instead of repeatedly rebuilding repository context from scratch.
 
 ---
 
 ## Frozen scope
 
-At the beginning of a review, the skill establishes one review target and keeps it stable.
+At the beginning of an actual review, the skill establishes one review target and keeps it stable.
 
 The target is selected from, in order:
 
@@ -192,41 +234,9 @@ The target is selected from, in order:
 
 The target is frozen with HEAD and merge-base SHAs, file statuses, content hashes, a Git-status hash, and a canonical diff hash. Untracked files are listed explicitly and reviewed in full. The worktree is captured before and after every reviewer turn.
 
-This prevents both scope drift and accidental omission while keeping the reviewer out of unrelated legacy code.
-
----
-
-## Context minimization
-
-The reviewer starts with:
-
-```text
-changed files
-+ changed symbols
-+ relevant tests
-```
-
-It expands outward only when needed to understand or prove a defect:
-
-```text
-callers
-callees
-interfaces
-contracts
-state transitions
-persistence boundaries
-schemas
-API boundaries
-related regression-sensitive behavior
-```
-
-Generated files, lockfiles, vendor code, huge fixtures, and unrelated modules are skipped unless behaviorally relevant.
-
 ---
 
 ## False-positive filtering
-
-Adversarial does **not** mean paranoid.
 
 The reviewer tries to disprove its own suspicions before reporting them. Then the main Codex agent independently checks every returned finding and classifies it as:
 
@@ -236,24 +246,19 @@ REJECTED
 UNCERTAIN
 ```
 
-Only confirmed defects should normally lead to code changes. A CRITICAL or HIGH finding can be rejected only with objective evidence such as a reproduction, an exact regression test, a documented contract, a type invariant, validation logic, or a concrete repository reference. An unresolved UNCERTAIN CRITICAL/HIGH finding forbids PASS.
+A CRITICAL or HIGH finding can be rejected only with objective evidence such as a reproduction, an exact regression test, a documented contract, a type invariant, validation logic, or a concrete repository reference. An unresolved UNCERTAIN CRITICAL/HIGH finding forbids PASS.
 
-This matters because an AI critic can be confidently wrong too.
+In degraded BEST_EFFORT mode those classifications can still be useful, but the overall result remains UNVERIFIED while runtime attestation is missing.
 
 ---
 
 ## Stop condition
 
-The goal is **not**:
-
-```text
-zero criticism
-```
-
 PASS requires:
 
 ```text
-review integrity proven
+runtime identity + sandbox attestation proven
++ review integrity proven
 + final scope hash matches the reviewed version
 + zero confirmed blocking correctness defects
 + zero unresolved UNCERTAIN CRITICAL/HIGH findings
@@ -265,7 +270,7 @@ Blocking severity levels are:
 - `HIGH`
 - `MEDIUM`
 
-The workflow does not keep consuming tokens because of style preferences, theoretical concerns, or minor LOW-severity issues.
+`UNVERIFIED` means the deterministic review artifacts are usable but runtime reviewer identity/isolation was not certified. `INCONCLUSIVE` means a stronger core-integrity requirement failed.
 
 ---
 
@@ -277,15 +282,14 @@ Requirements: Git and Python 3. The bundled guard deliberately fails closed when
 
 | Surface | Support |
 |---|---|
-| Codex desktop app, CLI, IDE extension | Full workflow after the skill and companion custom agent are installed |
+| Codex desktop app, CLI, IDE extension | STRICT works when the active runtime exposes trusted custom-agent identity and effective sandbox metadata; otherwise it stops early |
+| Same local surfaces with incomplete agent metadata | Use explicit BEST_EFFORT if you still want an UNVERIFIED review |
 | Local plugin marketplace | Skill packaging is supported; run the companion installer once to install the custom agent |
-| Codex cloud, ChatGPT Work/web/mobile | Not supported: these surfaces do not provide the required local Git/Python guard and verifiable custom-agent sandbox metadata |
+| Codex cloud, ChatGPT Work/web/mobile | Not supported for the certified local workflow because the required local Git/Python/runtime guarantees are unavailable |
 
-The plugin manifest packages the skill, but the current plugin format does not package standalone `.codex/agents/*.toml` files. A plugin-only install therefore fails closed until the companion agent is installed locally.
+The plugin manifest packages the skill, but the current plugin format does not package standalone `.codex/agents/*.toml` files. A plugin-only install therefore cannot provide the strict custom reviewer until the companion agent is installed locally.
 
 ## Global install — recommended
-
-Install once and use the skill in every Codex project.
 
 ### Windows
 
@@ -307,7 +311,7 @@ and the custom reviewer to:
 %USERPROFILE%\.codex\agents\adversarial-reviewer.toml
 ```
 
-If `CODEX_HOME` is set, the reviewer is installed under `%CODEX_HOME%\agents\` instead. The configured directory must already exist.
+If `CODEX_HOME` is set, the reviewer is installed under `%CODEX_HOME%\agents\` instead.
 
 ### macOS / Linux
 
@@ -323,7 +327,7 @@ The files are installed into:
 ~/.codex/agents/adversarial-reviewer.toml
 ```
 
-If `CODEX_HOME` is set, the reviewer is installed under `$CODEX_HOME/agents/` instead. The configured directory must already exist.
+If `CODEX_HOME` is set, the reviewer is installed under `$CODEX_HOME/agents/` instead.
 
 Restart Codex if the skill was not detected immediately.
 
@@ -348,23 +352,25 @@ chmod +x uninstall.sh
 
 # Usage
 
-## The simplest workflow
+## Strict review
 
-First let Codex implement your task normally.
-
-Then run:
+First let Codex implement your task normally, then run:
 
 ```text
 $adversarial-review
 ```
 
-That is it.
+STRICT is the default. If the runtime cannot certify the reviewer identity/sandbox contract, it exits early as INCONCLUSIVE.
 
----
+## Best-effort fallback
+
+```text
+Run $adversarial-review in BEST_EFFORT mode.
+```
+
+Use this when your Codex build does not expose enough trusted custom-agent metadata but you still want useful findings. Expect `UNVERIFIED` unless strict attestation becomes available.
 
 ## Run it automatically after a task
-
-You can also include it in the task itself:
 
 ```text
 Implement the new inventory system.
@@ -372,100 +378,38 @@ Run the relevant tests.
 Then run $adversarial-review.
 ```
 
-Or:
-
-```text
-Refactor the betting state machine and use $adversarial-review after the implementation is complete.
-```
+The skill is explicit-only so you decide when deeper review is worth the budget.
 
 ---
 
-## When you should use it
+# Example degraded runtime
 
-Good candidates:
+Suppose the spawn interface returns only a task name and does not expose effective custom-agent identity or sandbox metadata.
 
-- non-trivial feature implementation
-- bug fixes involving state or business logic
-- state machines
-- persistence code
-- financial or numerical logic
-- async workflows
-- concurrency-sensitive changes
-- authentication / authorization logic
-- large refactors
-- behavior where tests alone may create false confidence
-
-Usually unnecessary for:
-
-- comments
-- formatting
-- copy changes
-- trivial renames
-- tiny cosmetic UI adjustments
-
-The skill is explicit-only specifically so you decide when deeper review is worth the budget.
-
----
-
-# Example
-
-You ask Codex:
-
-```text
-Implement inventory stacking.
-```
-
-Codex implements it and tests pass.
-
-Then:
+STRICT:
 
 ```text
 $adversarial-review
+
+Adversarial review: INCONCLUSIVE
+- Mode: STRICT
+- Full reviews: 0/2
+- Runtime attestation: missing identity and sandbox
+- Inconclusive reasons: runtime preflight failed
 ```
 
-The reviewer may return:
+BEST_EFFORT:
 
 ```text
-HIGH — partial stack merge can destroy quantity
+Run $adversarial-review in BEST_EFFORT mode.
 
-Trigger:
-Target stack has less free capacity than the incoming quantity.
-
-Execution path:
-mergeItem()
-→ target quantity reaches max
-→ source slot is cleared unconditionally
-
-Actual:
-Remaining source quantity is lost.
-
-Expected:
-Only the transferred amount should leave the source stack.
-```
-
-The main Codex agent verifies the path, confirms the bug, fixes it, and adds a regression test.
-
-The same reviewer receives only the resulting patch and checks whether:
-
-- the original failure is actually fixed
-- the fix created a nearby regression
-- the regression test proves the behavior
-
-If no blocking defect remains:
-
-```text
-Adversarial review: PASS
-
-- Full reviews: 1
-- Incremental re-reviews: 1/2
-- Confirmed: Critical 0 / High 1 / Medium 0
-- Fixed: 1
-- Rejected false positives: 1
-- Uncertain: Critical 0 / High 0 / Medium 0
-- Scope manifest: <sha256>
-- Validation: targeted tests, build
-- Remaining blocking defects: none
-- Inconclusive reasons: none
+Adversarial review: UNVERIFIED
+- Mode: BEST_EFFORT
+- Full reviews: 1/2
+- Runtime attestation: missing identity and sandbox
+- Validation: completed
+- Candidate findings: available
+- Unverified reasons: reviewer identity/isolation not certified
 ```
 
 ---
@@ -478,34 +422,24 @@ User
  ▼
 Main Codex Agent
  │
- ├── implements feature
- ├── runs deterministic checks
- └── invokes skill
+ ├── invokes skill
+ └── runtime preflight
         │
-        ▼
-  adversarial_reviewer
+        ├── STRICT unsupported → INCONCLUSIVE / STOP
         │
-        ├── read-only
-        ├── diff-first
-        ├── reconstructs contracts
-        ├── hunts counterexamples
-        └── returns evidence
-        │
-        ▼
-Main Codex Agent
- │
- ├── verifies each finding
- ├── rejects false positives
- ├── fixes confirmed defects
- └── adds regression tests
-        │
-        ▼
-Same reviewer thread
- │
- └── targeted incremental recheck
-        │
-        ▼
- PASS / FAIL / INCONCLUSIVE
+        └── supported or BEST_EFFORT
+                 ↓
+        deterministic checks
+                 ↓
+           frozen manifest
+                 ↓
+       one reviewer thread
+                 ↓
+       verify response + snapshots
+                 ↓
+        verify/fix findings
+                 ↓
+ PASS / FAIL / UNVERIFIED / INCONCLUSIVE
 ```
 
 ---
@@ -521,6 +455,8 @@ skills/
     ├── SKILL.md
     ├── scripts/
     │   └── review_guard.py
+    ├── references/
+    │   └── best-effort-reviewer.md
     └── agents/
         └── openai.yaml
 
@@ -538,19 +474,19 @@ tests/
 
 ### `SKILL.md`
 
-Controls the review workflow, budget, scope selection, verification loop, fix loop, and stop condition.
+Controls runtime preflight, mode selection, review budget, scope selection, verification loop, repair loop, and stop condition.
 
 ### `review_guard.py`
 
-Deterministically captures complete change manifests, verifies immutable snapshots and reviewer JSON, escalates large fixes, and computes PASS, FAIL, or INCONCLUSIVE.
+Deterministically performs runtime preflight decisions, captures complete change manifests, verifies immutable snapshots and reviewer JSON, escalates large fixes, and computes PASS, FAIL, INCONCLUSIVE, or UNVERIFIED.
 
 ### `adversarial-reviewer.toml`
 
-Defines the independent read-only reviewer and its adversarial review behavior.
+Defines the preferred independent read-only custom reviewer and its adversarial behavior.
 
-### `openai.yaml`
+### `best-effort-reviewer.md`
 
-Contains Codex skill metadata and keeps the skill explicitly invoked rather than automatically triggered.
+Provides the self-contained reviewer contract used only when BEST_EFFORT must fall back to a generic child.
 
 ---
 
@@ -572,35 +508,17 @@ That shift in objective is the core of adversarial review.
 
 ---
 
-# Why not use three or five reviewers?
-
-You can — but this project intentionally does not.
-
-Multiple reviewers can improve diversity, but they also multiply:
-
-- repository reads
-- duplicated reasoning
-- duplicated findings
-- context usage
-- token consumption
-
-Devil's Advocate is designed as a **daily-driver review skill**, not a maximum-cost formal verification system.
-
-For most development work, one strong reviewer with good falsification instructions and a bounded repair loop is a better practical tradeoff.
-
----
-
 # Does this replace tests?
 
 No.
 
-The intended workflow is:
+The intended supported-runtime workflow is:
 
 ```text
-implementation
+runtime preflight
 → deterministic tests
 → adversarial reasoning
-→ repair
+→ repair when requested
 → regression tests
 → targeted recheck
 ```
@@ -613,35 +531,11 @@ Tests and adversarial review catch different classes of failure.
 
 No — and it deliberately never claims to.
 
-The final success statement is:
+The strict success statement is:
 
-> **No confirmed blocking defects remain in the reviewed scope.**
+> **No confirmed blocking defects remain in the proven reviewed scope.**
 
 That is much more defensible than claiming an implementation is perfect.
-
----
-
-# Philosophy
-
-A useful AI reviewer should not be rewarded for producing a long list of criticism.
-
-It should be rewarded for finding a **small number of defects that survive scrutiny**.
-
-```text
-Suspicion
-   ↓
-Is the state reachable?
-   ↓
-Can the execution path be traced?
-   ↓
-Does incorrect observable behavior result?
-   ↓
-Can the finding survive an independent check?
-   ↓
-CONFIRMED DEFECT
-```
-
-One subtle real bug is worth more than twenty generic observations.
 
 ---
 
@@ -653,8 +547,8 @@ One subtle real bug is worth more than twenty generic observations.
 3. Restart Codex if needed
 4. Open any code project
 5. Finish a non-trivial implementation
-6. Run $adversarial-review
-7. Let Codex verify and repair confirmed findings
+6. Run $adversarial-review (STRICT by default)
+7. If your runtime cannot expose trusted reviewer metadata and you still want findings, explicitly request BEST_EFFORT
 ```
 
 ---
