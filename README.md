@@ -97,7 +97,7 @@ No reviewer swarm. No endless recursive review loop. No full repository reread a
 | Feature | What it means |
 |---|---|
 | **1 reviewer only** | Avoids overlapping subagents and duplicated findings |
-| **Verified read-only reviewer** | Sandbox policy plus before/after worktree snapshots detect reviewer mutations |
+| **Verified read-only reviewer** | PASS requires runtime metadata proving the spawned reviewer is effectively read-only, plus unchanged before/after snapshots |
 | **Diff-first** | Starts from the actual change instead of ingesting the whole repository |
 | **Evidence-first** | Findings need a concrete trigger, execution path, and incorrect result |
 | **Objective verification** | CRITICAL/HIGH rejections require executable or repository evidence |
@@ -273,6 +273,16 @@ The workflow does not keep consuming tokens because of style preferences, theore
 
 Requirements: Git and Python 3. The bundled guard deliberately fails closed when it cannot capture or verify review state.
 
+## Supported Codex surfaces
+
+| Surface | Support |
+|---|---|
+| Codex desktop app, CLI, IDE extension | Full workflow after the skill and companion custom agent are installed |
+| Local plugin marketplace | Skill packaging is supported; run the companion installer once to install the custom agent |
+| Codex cloud, ChatGPT Work/web/mobile | Not supported: these surfaces do not provide the required local Git/Python guard and verifiable custom-agent sandbox metadata |
+
+The plugin manifest packages the skill, but the current plugin format does not package standalone `.codex/agents/*.toml` files. A plugin-only install therefore fails closed until the companion agent is installed locally.
+
 ## Global install — recommended
 
 Install once and use the skill in every Codex project.
@@ -297,6 +307,8 @@ and the custom reviewer to:
 %USERPROFILE%\.codex\agents\adversarial-reviewer.toml
 ```
 
+If `CODEX_HOME` is set, the reviewer is installed under `%CODEX_HOME%\agents\` instead. The configured directory must already exist.
+
 ### macOS / Linux
 
 ```bash
@@ -310,6 +322,8 @@ The files are installed into:
 ~/.agents/skills/adversarial-review/
 ~/.codex/agents/adversarial-reviewer.toml
 ```
+
+If `CODEX_HOME` is set, the reviewer is installed under `$CODEX_HOME/agents/` instead. The configured directory must already exist.
 
 Restart Codex if the skill was not detected immediately.
 
@@ -499,14 +513,16 @@ Same reviewer thread
 # Repository layout
 
 ```text
-.agents/
-└── skills/
-    └── adversarial-review/
-        ├── SKILL.md
-        ├── scripts/
-        │   └── review_guard.py
-        └── agents/
-            └── openai.yaml
+.codex-plugin/
+└── plugin.json
+
+skills/
+└── adversarial-review/
+    ├── SKILL.md
+    ├── scripts/
+    │   └── review_guard.py
+    └── agents/
+        └── openai.yaml
 
 .codex/
 └── agents/

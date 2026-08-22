@@ -1,0 +1,23 @@
+{
+  "name": "codex-devil-advocate",
+  "version": "1.0.0",
+  "description": "Bounded adversarial correctness review for completed code changes.",
+  "author": {
+    "name": "wavehs"
+  },
+  "license": "MIT",
+  "keywords": ["code-review", "correctness", "codex"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Devil's Advocate",
+    "shortDescription": "Independent adversarial correctness review",
+    "longDescription": "Review completed code changes with one bounded adversarial reviewer and fail-closed integrity checks.",
+    "developerName": "wavehs",
+    "category": "Developer Tools",
+    "capabilities": ["Read"],
+    "defaultPrompt": [
+      "Run adversarial review on the completed code change."
+    ],
+    "brandColor": "#DC2626"
+  }
+}

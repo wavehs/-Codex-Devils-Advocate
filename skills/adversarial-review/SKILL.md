@@ -22,6 +22,7 @@ Never substitute a generic reviewer for `adversarial_reviewer`.
 PASS requires all of the following:
 
 - the exact custom agent `adversarial_reviewer` was verified from spawn metadata;
+- the spawned reviewer's effective sandbox was verified as `read-only` from runtime metadata;
 - it successfully completed every required review turn;
 - every response passed the bundled protocol validator;
 - the full change manifest was captured successfully, including untracked files;
@@ -97,9 +98,9 @@ Compare it to the original frozen manifest. If they differ, rebuild the brief fr
 
 Spawn exactly one custom agent by the configured name `adversarial_reviewer`. Do not request `default`, `worker`, `explorer`, or another generic role.
 
-Before trusting any output, verify from the spawn result or agent-thread metadata that the selected custom agent name is exactly `adversarial_reviewer`. The TOML `name` field is authoritative; the task label or a prompt claiming the name is not proof.
+Before trusting any output, verify from the spawn result or agent-thread metadata that the selected custom agent name is exactly `adversarial_reviewer` and its effective sandbox is exactly `read-only`. The TOML fields are defaults only: parent runtime overrides can supersede them. A task label, prompt claim, or the local TOML file alone is not runtime proof.
 
-If the surface does not expose the selected custom-agent identity, or if spawn selects a different agent, return INCONCLUSIVE. Do not retry with a generic fallback.
+If the surface does not expose the selected custom-agent identity and effective sandbox, if spawn selects a different agent, or if the effective sandbox is not `read-only`, return INCONCLUSIVE. Do not retry with a generic fallback.
 
 Give the reviewer:
 
@@ -195,7 +196,7 @@ Capture once more immediately before announcing PASS and compare again. Any unex
 
 Build the guard decision input with:
 
-- all eight integrity booleans required by `review_guard.py decide`;
+- all nine integrity booleans required by `review_guard.py decide`;
 - validation state;
 - escalation requirement and completion;
 - every finding's severity and classification;

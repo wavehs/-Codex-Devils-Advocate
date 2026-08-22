@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-GUARD_PATH = ROOT / ".agents/skills/adversarial-review/scripts/review_guard.py"
+GUARD_PATH = ROOT / "skills/adversarial-review/scripts/review_guard.py"
 SPEC = importlib.util.spec_from_file_location("review_guard", GUARD_PATH)
 assert SPEC and SPEC.loader
 review_guard = importlib.util.module_from_spec(SPEC)
@@ -140,6 +140,11 @@ class ReviewGuardTests(unittest.TestCase):
         payload["integrity"]["reviewer_completed"] = False
         self.assertEqual(review_guard.decide_state(payload)["state"], "INCONCLUSIVE")
 
+    def test_non_read_only_reviewer_forces_inconclusive(self) -> None:
+        payload = self.valid_decision_payload()
+        payload["integrity"]["effective_sandbox_read_only"] = False
+        self.assertEqual(review_guard.decide_state(payload)["state"], "INCONCLUSIVE")
+
     def test_unreviewed_final_version_forces_inconclusive(self) -> None:
         payload = self.valid_decision_payload()
         payload["integrity"]["final_version_reviewed"] = False
@@ -174,6 +179,7 @@ class ReviewGuardTests(unittest.TestCase):
             "integrity": {
                 "reviewer_spawned": True,
                 "correct_reviewer": True,
+                "effective_sandbox_read_only": True,
                 "reviewer_completed": True,
                 "result_valid": True,
                 "scope_complete": True,

@@ -1,10 +1,14 @@
 $ErrorActionPreference = "Stop"
 
-$skillSource = Join-Path $PSScriptRoot ".agents\skills\adversarial-review"
+$skillSource = Join-Path $PSScriptRoot "skills\adversarial-review"
 $agentSource = Join-Path $PSScriptRoot ".codex\agents\adversarial-reviewer.toml"
 
 $skillsRoot = Join-Path $HOME ".agents\skills"
-$agentsRoot = Join-Path $HOME ".codex\agents"
+$codexRoot = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
+if ($env:CODEX_HOME -and -not (Test-Path -LiteralPath $codexRoot -PathType Container)) {
+    throw "CODEX_HOME does not exist or is not a directory: $codexRoot"
+}
+$agentsRoot = Join-Path $codexRoot "agents"
 $skillTarget = Join-Path $skillsRoot "adversarial-review"
 $agentTarget = Join-Path $agentsRoot "adversarial-reviewer.toml"
 

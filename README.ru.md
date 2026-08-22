@@ -90,7 +90,7 @@ DIFF-FIRST ВЫБОР КОНТЕКСТА
 | Возможность | Что это даёт |
 |---|---|
 | **Только 1 reviewer** | Нет нескольких агентов, читающих один и тот же код и дублирующих находки |
-| **Проверяемый read-only reviewer** | Sandbox и снимки worktree до/после обнаруживают изменения reviewer-а |
+| **Проверяемый read-only reviewer** | PASS требует runtime metadata, подтверждающие эффективный read-only sandbox reviewer-а, и неизменные снимки до/после |
 | **Diff-first** | Сначала анализируются реальные изменения, а не весь репозиторий |
 | **Evidence-first** | Для finding нужен конкретный trigger, execution path и неправильный результат |
 | **Объективная проверка** | Для REJECTED CRITICAL/HIGH нужно исполняемое или repository evidence |
@@ -268,6 +268,16 @@ Skill не продолжает расходовать токены из-за st
 
 Требования: Git и Python 3. Встроенный guard намеренно возвращает INCONCLUSIVE, если не может надёжно зафиксировать или проверить состояние review.
 
+## Поддерживаемые поверхности Codex
+
+| Поверхность | Поддержка |
+|---|---|
+| Codex desktop app, CLI, IDE extension | Полный workflow после установки skill и companion custom agent |
+| Локальный plugin marketplace | Skill упакован как plugin; companion installer нужно один раз запустить для установки custom agent |
+| Codex cloud, ChatGPT Work/web/mobile | Не поддерживаются: отсутствуют необходимые локальные Git/Python guard и проверяемые sandbox metadata custom agent |
+
+Plugin manifest упаковывает skill, но текущий plugin-формат не упаковывает standalone-файлы `.codex/agents/*.toml`. Поэтому установка только plugin-а намеренно завершается fail-closed, пока companion agent не установлен локально.
+
 ## Глобальная установка — рекомендуется
 
 Установите один раз и используйте skill во всех проектах Codex.
@@ -292,6 +302,8 @@ Custom reviewer будет установлен в:
 %USERPROFILE%\.codex\agents\adversarial-reviewer.toml
 ```
 
+Если задан `CODEX_HOME`, reviewer устанавливается в `%CODEX_HOME%\agents\`. Указанная директория должна уже существовать.
+
 ### macOS / Linux
 
 ```bash
@@ -305,6 +317,8 @@ chmod +x install.sh
 ~/.agents/skills/adversarial-review/
 ~/.codex/agents/adversarial-reviewer.toml
 ```
+
+Если задан `CODEX_HOME`, reviewer устанавливается в `$CODEX_HOME/agents/`. Указанная директория должна уже существовать.
 
 Если Codex сразу не увидел skill, перезапустите его.
 
@@ -495,14 +509,16 @@ Adversarial review: PASS
 # Структура репозитория
 
 ```text
-.agents/
-└── skills/
-    └── adversarial-review/
-        ├── SKILL.md
-        ├── scripts/
-        │   └── review_guard.py
-        └── agents/
-            └── openai.yaml
+.codex-plugin/
+└── plugin.json
+
+skills/
+└── adversarial-review/
+    ├── SKILL.md
+    ├── scripts/
+    │   └── review_guard.py
+    └── agents/
+        └── openai.yaml
 
 .codex/
 └── agents/

@@ -546,6 +546,7 @@ def decide_state(payload: Any) -> dict[str, Any]:
     required_integrity = {
         "reviewer_spawned",
         "correct_reviewer",
+        "effective_sandbox_read_only",
         "reviewer_completed",
         "result_valid",
         "scope_complete",
