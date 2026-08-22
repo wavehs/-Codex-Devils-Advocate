@@ -157,7 +157,8 @@ def untracked_changes(repo: Path) -> list[dict[str, Any]]:
 def path_fingerprint(repo: Path, relative_path: str) -> dict[str, Any]:
     path = repo / relative_path
     try:
-        mode = path.lstat().st_mode
+        st = path.lstat()
+        mode = st.st_mode
     except FileNotFoundError:
         return {"kind": "missing", "size": None, "sha256": None}
     except OSError as exc:
@@ -171,16 +172,20 @@ def path_fingerprint(repo: Path, relative_path: str) -> dict[str, Any]:
         payload = b"symlink\0" + os.fsencode(target)
         return {"kind": "symlink", "size": len(payload), "sha256": sha256(payload)}
     if stat.S_ISREG(mode):
-        digest = hashlib.sha256()
-        size = 0
         try:
             with path.open("rb") as handle:
-                while chunk := handle.read(1024 * 1024):
-                    digest.update(chunk)
-                    size += len(chunk)
+                if hasattr(hashlib, "file_digest"):
+                    # Use optimized hashlib.file_digest if available
+                    digest = hashlib.file_digest(handle, "sha256").hexdigest()
+                else:
+                    h = hashlib.sha256()
+                    while chunk := handle.read(1024 * 1024):
+                        h.update(chunk)
+                    digest = h.hexdigest()
+            size = st.st_size
         except OSError as exc:
             raise GuardError(f"cannot read {relative_path}: {exc}") from exc
-        return {"kind": "file", "size": size, "sha256": digest.hexdigest()}
+        return {"kind": "file", "size": size, "sha256": digest}
     if stat.S_ISDIR(mode):
         submodule_head = run_git(path, "rev-parse", "HEAD", check=False).decode(
             "utf-8", "replace"
