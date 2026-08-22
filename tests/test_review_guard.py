@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import subprocess
 import tempfile
 import unittest
@@ -67,9 +66,7 @@ class ReviewGuardTests(unittest.TestCase):
         git(self.repo, "add", "deleted.txt", "added.txt")
         git(self.repo, "commit", "-qm", "branch changes")
 
-        manifest = review_guard.build_manifest(
-            str(self.repo), "base-snapshot", []
-        )
+        manifest = review_guard.build_manifest(str(self.repo), "base-snapshot", [])
 
         changes = {
             (change["path"], change["layer"], change["change_type"])
@@ -84,29 +81,74 @@ class ReviewGuardTests(unittest.TestCase):
         self.assertIsNone(deleted["current"]["sha256"])
         self.assertIsNotNone(deleted["baseline_sha256"])
 
-    def test_valid_review_result_covers_every_scope_path(self) -> None:
-        (self.repo / "new.py").write_text("pass\n", encoding="utf-8")
-        manifest = review_guard.build_manifest(str(self.repo), None, [])
-        result = {
+    def review_result(self, manifest: dict, confidence: int | float = 99) -> dict:
+        return {
             "protocol_version": "1",
             "reviewer_name": "adversarial_reviewer",
             "review_id": "review-1",
             "review_kind": "FULL",
             "status": "COMPLETED",
             "scope_manifest_sha256": manifest["manifest_sha256"],
-            "reviewed_paths": ["new.py"],
-            "summary": "No blocking defect found.",
-            "findings": [],
+            "reviewed_paths": [entry["path"] for entry in manifest["scope_files"]],
+            "summary": "One concrete defect found.",
+            "findings": [
+                {
+                    "id": "F1",
+                    "severity": "HIGH",
+                    "confidence": confidence,
+                    "location": {"path": "tracked.txt", "line": 1, "symbol": "sample"},
+                    "violated_contract": "Sample contract.",
+                    "trigger": "Sample trigger.",
+                    "execution_path": "Sample path.",
+                    "actual": "Wrong result.",
+                    "expected": "Correct result.",
+                    "regression_test": "Sample regression test.",
+                }
+            ],
         }
-        validated = review_guard.validate_review_result(
-            result, manifest, "review-1", "FULL"
-        )
+
+    def test_valid_review_result_covers_every_scope_path(self) -> None:
+        (self.repo / "new.py").write_text("pass\n", encoding="utf-8")
+        manifest = review_guard.build_manifest(str(self.repo), None, [])
+        result = self.review_result(manifest)
+        validated = review_guard.validate_review_result(result, manifest, "review-1", "FULL")
         self.assertEqual(validated, result)
+
+    def test_fractional_confidence_is_accepted_without_rewriting_result(self) -> None:
+        (self.repo / "new.py").write_text("pass\n", encoding="utf-8")
+        manifest = review_guard.build_manifest(str(self.repo), None, [])
+        result = self.review_result(manifest, confidence=0.99)
+
+        validated = review_guard.validate_review_result(result, manifest, "review-1", "FULL")
+
+        self.assertEqual(validated["findings"][0]["confidence"], 0.99)
+        self.assertIsInstance(validated["findings"][0]["confidence"], float)
+
+    def test_out_of_range_fractional_confidence_is_rejected(self) -> None:
+        (self.repo / "new.py").write_text("pass\n", encoding="utf-8")
+        manifest = review_guard.build_manifest(str(self.repo), None, [])
+        result = self.review_result(manifest, confidence=1.01)
+
+        with self.assertRaises(review_guard.GuardError):
+            review_guard.validate_review_result(result, manifest, "review-1", "FULL")
 
     def test_empty_or_wrong_reviewer_result_is_invalid(self) -> None:
         manifest = review_guard.build_manifest(str(self.repo), None, ["tracked.txt"])
         with self.assertRaises(review_guard.GuardError):
             review_guard.validate_review_result({}, manifest, "review-1", "FULL")
+
+    def test_strict_preflight_stops_before_expensive_review_without_runtime_attestation(self) -> None:
+        result = review_guard.runtime_preflight("STRICT", False, False)
+        self.assertFalse(result["proceed"])
+        self.assertEqual(result["state"], "INCONCLUSIVE")
+        self.assertIn("runtime:custom-agent-identity-unverifiable", result["reasons"])
+        self.assertIn("runtime:effective-sandbox-unverifiable", result["reasons"])
+
+    def test_best_effort_preflight_can_continue_degraded(self) -> None:
+        result = review_guard.runtime_preflight("BEST_EFFORT", False, False)
+        self.assertTrue(result["proceed"])
+        self.assertTrue(result["degraded"])
+        self.assertEqual(result["state"], "UNVERIFIED")
 
     def test_uncertain_high_forces_inconclusive(self) -> None:
         payload = self.valid_decision_payload()
@@ -140,10 +182,32 @@ class ReviewGuardTests(unittest.TestCase):
         payload["integrity"]["reviewer_completed"] = False
         self.assertEqual(review_guard.decide_state(payload)["state"], "INCONCLUSIVE")
 
-    def test_non_read_only_reviewer_forces_inconclusive(self) -> None:
+    def test_non_read_only_reviewer_forces_inconclusive_in_strict_mode(self) -> None:
         payload = self.valid_decision_payload()
         payload["integrity"]["effective_sandbox_read_only"] = False
         self.assertEqual(review_guard.decide_state(payload)["state"], "INCONCLUSIVE")
+
+    def test_best_effort_runtime_attestation_gap_returns_unverified(self) -> None:
+        payload = self.valid_decision_payload(mode="BEST_EFFORT")
+        payload["integrity"]["correct_reviewer"] = False
+        payload["integrity"]["effective_sandbox_read_only"] = False
+
+        decision = review_guard.decide_state(payload)
+
+        self.assertEqual(decision["state"], "UNVERIFIED")
+        self.assertEqual(decision["inconclusive_reasons"], [])
+        self.assertIn("integrity:correct_reviewer", decision["unverified_reasons"])
+        self.assertIn("integrity:effective_sandbox_read_only", decision["unverified_reasons"])
+
+    def test_best_effort_does_not_hide_non_attestation_integrity_failure(self) -> None:
+        payload = self.valid_decision_payload(mode="BEST_EFFORT")
+        payload["integrity"]["correct_reviewer"] = False
+        payload["integrity"]["result_valid"] = False
+        self.assertEqual(review_guard.decide_state(payload)["state"], "INCONCLUSIVE")
+
+    def test_best_effort_with_full_attestation_can_still_pass(self) -> None:
+        payload = self.valid_decision_payload(mode="BEST_EFFORT")
+        self.assertEqual(review_guard.decide_state(payload)["state"], "PASS")
 
     def test_unreviewed_final_version_forces_inconclusive(self) -> None:
         payload = self.valid_decision_payload()
@@ -174,8 +238,9 @@ class ReviewGuardTests(unittest.TestCase):
         )
 
     @staticmethod
-    def valid_decision_payload() -> dict:
+    def valid_decision_payload(mode: str = "STRICT") -> dict:
         return {
+            "mode": mode,
             "integrity": {
                 "reviewer_spawned": True,
                 "correct_reviewer": True,

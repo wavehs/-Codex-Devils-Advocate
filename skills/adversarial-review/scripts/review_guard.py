@@ -19,6 +19,17 @@ PROTOCOL_VERSION = "1"
 BLOCKING_SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM"}
 SEVERITIES = BLOCKING_SEVERITIES | {"LOW"}
 CLASSIFICATIONS = {"CONFIRMED", "REJECTED", "UNCERTAIN"}
+REVIEW_MODES = {"STRICT", "BEST_EFFORT"}
+RUNTIME_ATTESTATION_KEYS = {"correct_reviewer", "effective_sandbox_read_only"}
+CORE_INTEGRITY_KEYS = {
+    "reviewer_spawned",
+    "reviewer_completed",
+    "result_valid",
+    "scope_complete",
+    "worktree_unchanged",
+    "final_version_reviewed",
+    "followups_delivered",
+}
 REJECTION_EVIDENCE_TYPES = {
     "executable_reproduction",
     "passing_regression_test",
@@ -434,6 +445,16 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
     return manifest
 
 
+def valid_confidence(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return 0 <= value <= 100
+    if isinstance(value, float):
+        return math.isfinite(value) and 0.0 <= value <= 1.0
+    return False
+
+
 def validate_review_result(
     result: Any, manifest: dict[str, Any], review_id: str, review_kind: str
 ) -> dict[str, Any]:
@@ -491,8 +512,7 @@ def validate_review_result(
         seen_ids.add(finding["id"])
         if finding["severity"] not in SEVERITIES:
             raise GuardError(f"finding {finding['id']} has an invalid severity")
-        confidence = finding["confidence"]
-        if not isinstance(confidence, int) or isinstance(confidence, bool) or not 0 <= confidence <= 100:
+        if not valid_confidence(finding["confidence"]):
             raise GuardError(f"finding {finding['id']} has an invalid confidence")
         location = finding["location"]
         if not isinstance(location, dict) or not isinstance(location.get("path"), str):
@@ -537,28 +557,68 @@ def assess_fix(
     return {"full_review_required": bool(reasons), "reasons": reasons}
 
 
+def runtime_preflight(
+    mode: str, identity_verifiable: bool, sandbox_read_only_verifiable: bool
+) -> dict[str, Any]:
+    if mode not in REVIEW_MODES:
+        raise GuardError(f"unsupported review mode: {mode!r}")
+    reasons: list[str] = []
+    if not identity_verifiable:
+        reasons.append("runtime:custom-agent-identity-unverifiable")
+    if not sandbox_read_only_verifiable:
+        reasons.append("runtime:effective-sandbox-unverifiable")
+
+    if mode == "STRICT" and reasons:
+        return {
+            "mode": mode,
+            "proceed": False,
+            "degraded": False,
+            "state": "INCONCLUSIVE",
+            "reasons": reasons,
+        }
+    return {
+        "mode": mode,
+        "proceed": True,
+        "degraded": bool(reasons),
+        "state": "UNVERIFIED" if reasons else None,
+        "reasons": reasons,
+    }
+
+
 def decide_state(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise GuardError("decision input must be a JSON object")
+
+    mode = payload.get("mode", "STRICT")
+    if mode not in REVIEW_MODES:
+        return {
+            "mode": mode,
+            "state": "INCONCLUSIVE",
+            "inconclusive_reasons": ["mode:invalid"],
+            "unverified_reasons": [],
+            "confirmed_blocking": [],
+        }
+
     integrity = payload.get("integrity")
     if not isinstance(integrity, dict):
         raise GuardError("decision input integrity must be an object")
-    required_integrity = {
-        "reviewer_spawned",
-        "correct_reviewer",
-        "effective_sandbox_read_only",
-        "reviewer_completed",
-        "result_valid",
-        "scope_complete",
-        "worktree_unchanged",
-        "final_version_reviewed",
-        "followups_delivered",
-    }
-    inconclusive_reasons = [
+
+    core_failures = [
         f"integrity:{key}"
-        for key in sorted(required_integrity)
+        for key in sorted(CORE_INTEGRITY_KEYS)
         if integrity.get(key) is not True
     ]
+    attestation_failures = [
+        f"integrity:{key}"
+        for key in sorted(RUNTIME_ATTESTATION_KEYS)
+        if integrity.get(key) is not True
+    ]
+    inconclusive_reasons = list(core_failures)
+    unverified_reasons: list[str] = []
+    if mode == "STRICT":
+        inconclusive_reasons.extend(attestation_failures)
+    else:
+        unverified_reasons.extend(attestation_failures)
 
     validation = payload.get("validation")
     if validation not in {"PASSED", "FAILED", "INCONCLUSIVE"}:
@@ -608,20 +668,37 @@ def decide_state(payload: Any) -> dict[str, Any]:
 
     if inconclusive_reasons:
         state = "INCONCLUSIVE"
+    elif mode == "BEST_EFFORT" and unverified_reasons:
+        state = "UNVERIFIED"
     elif validation == "FAILED" or confirmed_blocking:
         state = "FAIL"
     else:
         state = "PASS"
     return {
+        "mode": mode,
         "state": state,
         "inconclusive_reasons": sorted(set(inconclusive_reasons)),
+        "unverified_reasons": sorted(set(unverified_reasons)),
         "confirmed_blocking": confirmed_blocking,
     }
+
+
+def yes_no(value: str) -> bool:
+    return value == "yes"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    preflight = subparsers.add_parser(
+        "preflight", help="decide whether the current Codex runtime can start the review"
+    )
+    preflight.add_argument("--mode", choices=sorted(REVIEW_MODES), default="STRICT")
+    preflight.add_argument("--identity-verifiable", choices=["yes", "no"], required=True)
+    preflight.add_argument(
+        "--sandbox-read-only-verifiable", choices=["yes", "no"], required=True
+    )
 
     capture = subparsers.add_parser("capture", help="capture a frozen change manifest")
     capture.add_argument("--repo", default=".")
@@ -650,7 +727,9 @@ def build_parser() -> argparse.ArgumentParser:
     assess.add_argument("--current", required=True)
     assess.add_argument("--semantic", action="append", default=[])
 
-    decide = subparsers.add_parser("decide", help="compute PASS, FAIL, or INCONCLUSIVE")
+    decide = subparsers.add_parser(
+        "decide", help="compute PASS, FAIL, INCONCLUSIVE, or UNVERIFIED"
+    )
     decide.add_argument("--input", required=True)
     return parser
 
@@ -658,6 +737,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     try:
+        if args.command == "preflight":
+            write_json(
+                None,
+                runtime_preflight(
+                    args.mode,
+                    yes_no(args.identity_verifiable),
+                    yes_no(args.sandbox_read_only_verifiable),
+                ),
+            )
+            return 0
         if args.command == "capture":
             write_json(args.output, build_manifest(args.repo, args.base, args.include))
             return 0
