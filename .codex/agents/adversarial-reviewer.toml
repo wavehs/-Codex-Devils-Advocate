@@ -49,7 +49,7 @@ Return exactly one JSON object and nothing else: no Markdown fence, preface, or 
     {
       "id": "F1",
       "severity": "CRITICAL | HIGH | MEDIUM | LOW",
-      "confidence": 0,
+      "confidence": 95,
       "location": {"path": "relative/path", "line": 1, "symbol": "name"},
       "violated_contract": "<non-empty>",
       "trigger": "<non-empty concrete trigger/state>",
@@ -61,5 +61,6 @@ Return exactly one JSON object and nothing else: no Markdown fence, preface, or 
   ]
 }
 
+`confidence` MUST be an integer from 0 to 100. Do not use a 0.0-1.0 fraction.
 Use `findings: []` when no evidence-backed defect exists, but still populate every envelope field and every reviewed path. Never return an empty response. Merge findings with the same root cause and order them by severity and confidence. One real bug is more valuable than many weak observations.
 """
